@@ -2,7 +2,7 @@
 # AKShare Gateway — Docker Compose
 # ============================================================
 # 独立部署的 akshare 数据网关
-# 端口: 9898 (内网访问)
+# 端口: 9898
 # ============================================================
 
 services:
@@ -25,16 +25,9 @@ services:
       TZ: Asia/Shanghai
     ports:
       - "9898:9898"
-    networks:
-      - app_s-ai-agent-net
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9898/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 30s
-
-networks:
-  app_s-ai-agent-net:
-    external: true
-
