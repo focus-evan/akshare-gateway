@@ -1,12 +1,9 @@
 """
-AKShare Gateway API 测试脚本
+AKShare Gateway v2.0 API 测试脚本
 
 用法:
-    # 测试本地起动的网关
-    python test_gateway.py
-
-    # 测试指定地址
-    python test_gateway.py http://your-server:9898
+    python test_gateway.py                          # 测试本地
+    python test_gateway.py http://your-server:9898  # 测试指定地址
 """
 
 import sys
@@ -16,10 +13,13 @@ import requests
 
 
 BASE_URL = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:9898"
+PASS = 0
+FAIL = 0
 
 
 def test_endpoint(name: str, path: str, params: dict = None, expect_data: bool = True):
     """测试单个接口"""
+    global PASS, FAIL
     url = f"{BASE_URL}{path}"
     print(f"\n{'='*60}")
     print(f"📡 测试: {name}")
@@ -29,7 +29,7 @@ def test_endpoint(name: str, path: str, params: dict = None, expect_data: bool =
 
     try:
         start = time.time()
-        resp = requests.get(url, params=params, timeout=60)
+        resp = requests.get(url, params=params, timeout=120)
         elapsed = time.time() - start
 
         print(f"   状态码: {resp.status_code}")
@@ -42,74 +42,101 @@ def test_endpoint(name: str, path: str, params: dict = None, expect_data: bool =
             print(f"   数据行数: {count}")
 
             if data and len(data) > 0:
-                # 显示前2条数据的字段
                 print(f"   字段: {list(data[0].keys())}")
                 for i, row in enumerate(data[:2]):
-                    # 截断过长的值
                     short = {k: (str(v)[:50] if len(str(v)) > 50 else v) for k, v in row.items()}
                     print(f"   示例[{i}]: {json.dumps(short, ensure_ascii=False)[:200]}")
                 print(f"   ✅ 通过")
+                PASS += 1
             elif not expect_data:
                 print(f"   ⚠️ 无数据（可能正常）")
+                PASS += 1
             else:
                 print(f"   ⚠️ 返回空数据")
+                FAIL += 1
         else:
             print(f"   ❌ 失败: {resp.text[:200]}")
+            FAIL += 1
 
     except requests.exceptions.ConnectionError:
         print(f"   ❌ 连接失败，请确认网关是否已启动")
+        FAIL += 1
     except Exception as e:
         print(f"   ❌ 异常: {e}")
+        FAIL += 1
 
 
 def main():
-    print(f"🚀 AKShare Gateway 接口测试")
+    print(f"🚀 AKShare Gateway v2.0 接口测试")
     print(f"   目标: {BASE_URL}")
 
-    # 1. 健康检查
+    # ===== 基础功能 =====
     test_endpoint("健康检查", "/health")
 
-    # 2. A股实时行情（最常用，也是最容易被反爬的接口）
-    test_endpoint("A股实时行情 (stock_zh_a_spot_em)", "/api/stock/zh_a_spot_em")
+    # ===== 核心接口 =====
+    test_endpoint("A股实时行情", "/api/stock/zh_a_spot_em")
+    test_endpoint("A股实时行情(缓存命中)", "/api/stock/zh_a_spot_em")  # 第二次应走缓存
 
-    # 3. 个股历史K线
+    test_endpoint("港股实时行情", "/api/stock/hk_spot_em")
+
     test_endpoint(
-        "个股历史K线 (stock_zh_a_hist)",
+        "个股历史K线",
         "/api/stock/zh_a_hist",
-        params={
-            "symbol": "600519",
-            "period": "daily",
-            "start_date": "20241201",
-            "end_date": "20241231",
-            "adjust": "qfq",
-        },
+        params={"symbol": "600519", "period": "daily",
+                "start_date": "20241201", "end_date": "20241231", "adjust": "qfq"},
     )
 
-    # 4. 涨停股池
-    from datetime import datetime, timedelta
-    # 使用前一个交易日
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+    # ===== 新增接口 =====
     test_endpoint(
-        "涨停股池 (stock_zt_pool_em)",
-        "/api/stock/zt_pool_em",
-        params={"date": yesterday},
-        expect_data=False,  # 非交易日可能无数据
+        "个股PE/PB指标(护城河依赖)",
+        "/api/stock/a_indicator_lg",
+        params={"symbol": "600519"},
     )
 
-    # 5. 概念板块列表
-    test_endpoint("概念板块列表 (board_concept_name_em)", "/api/stock/board_concept_name_em")
+    test_endpoint(
+        "个股详细信息",
+        "/api/stock/individual_info_em",
+        params={"symbol": "600519"},
+    )
 
-    # 6. 全球财经快讯
-    test_endpoint("全球财经快讯-东财 (info_global_em)", "/api/stock/info_global_em")
+    test_endpoint(
+        "北向资金持仓",
+        "/api/stock/hsgt_hold_stock_em",
+        params={"market": "北向", "indicator": "今日排行"},
+    )
 
-    # 7. A股代码名称
-    test_endpoint("A股代码名称 (info_a_code_name)", "/api/stock/info_a_code_name")
+    test_endpoint(
+        "资金流向排名",
+        "/api/stock/individual_fund_flow_rank",
+        params={"indicator": "今日"},
+    )
 
-    # 8. 通用代理
-    test_endpoint("通用代理测试 (stock_info_a_code_name)", "/api/akshare/stock_info_a_code_name")
+    # ===== 板块 =====
+    test_endpoint("概念板块列表(东财)", "/api/stock/board_concept_name_em")
 
+    # ===== 通用代理(万能接口) =====
+    test_endpoint(
+        "通用代理: stock_a_indicator_lg",
+        "/api/akshare/stock_a_indicator_lg",
+        params={"symbol": "000300"},
+    )
+
+    test_endpoint("A股代码名称", "/api/stock/info_a_code_name")
+
+    # ===== 涨跌停 =====
+    from datetime import datetime, timedelta
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+    test_endpoint("涨停股池", "/api/stock/zt_pool_em", params={"date": yesterday}, expect_data=False)
+
+    # ===== 监控统计 =====
+    test_endpoint("请求统计", "/stats")
+
+    # ===== 结果汇总 =====
     print(f"\n{'='*60}")
-    print(f"🏁 测试完成")
+    print(f"🏁 测试完成: ✅ {PASS} 通过, ❌ {FAIL} 失败")
+    total = PASS + FAIL
+    if total > 0:
+        print(f"   通过率: {PASS/total*100:.0f}%")
 
 
 if __name__ == "__main__":
