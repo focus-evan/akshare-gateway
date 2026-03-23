@@ -1722,21 +1722,37 @@ async def stock_board_concept_cons_em(
         _reset_connections()
         time.sleep(random.uniform(1.0, 2.0))
 
-        # 数据源3: 同花顺备用（动态查找函数名）
-        for ths_name in ['stock_board_concept_cons_ths', 'stock_board_cons_ths']:
-            ths_func = getattr(ak, ths_name, None)
-            if ths_func is not None:
-                try:
-                    df = _retry(ths_func, max_retries=2, delay=1.5,
-                                 symbol=symbol)
-                    if df is not None and not df.empty:
-                        cache.set(cache_k, df, 300)
-                        _record_stat(func_name, (time.time() - start) * 1000)
-                        _record_success()
-                        return _df_to_response(df)
-                except Exception as ths_err:
-                    logger.warning(f"{ths_name} failed",
-                                   error=str(ths_err)[:150])
+        # 数据源3: 同花顺(web版备用)
+        try:
+            # 内联简单实现一个 THS 网页抓取，绕过 akshare 缺失的同花顺概念函数以及东财封锁
+            def _fetch_ths_web():
+                import urllib.request
+                ths_codes = {"人工智能": "301558", "低空经济": "309062", "机器人概念": "301432"}
+                code = ths_codes.get(symbol)
+                if not code: return pd.DataFrame()
+                req = urllib.request.Request(
+                    f"http://q.10jqka.com.cn/gn/detail/code/{code}/",
+                    headers=_build_browser_headers()
+                )
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    html = response.read().decode('gbk', errors='ignore')
+                    dfs = pd.read_html(html)
+                    if dfs:
+                        df = dfs[0].rename(columns={'名称': '名称', '最新': '最新价'})
+                        df['代码'] = df['代码'].astype(str).str.zfill(6)
+                        return df
+                return pd.DataFrame()
+            
+            df = _fetch_ths_web()
+            if df is not None and not df.empty:
+                cache.set(cache_k, df, 300)
+                _record_stat(func_name, (time.time() - start) * 1000)
+                _record_success()
+                logger.info("同花顺 Web 抓取备用成功", symbol=symbol, rows=len(df))
+                return _df_to_response(df)
+        except Exception as ths_web_err:
+            logger.warning("同花顺 Web 备用失败", error=str(ths_web_err)[:150])
+
 
         # 最后尝试过期缓存
         with cache._lock:
@@ -1917,6 +1933,21 @@ async def generic_akshare_proxy(func_name: str, request: Request):
     安全限制: 只允许调用白名单前缀的函数
     """
     start = time.time()
+
+    # 从 query params 提取参数
+    params = dict(request.query_params)
+    logger.info("Generic proxy call", func=func_name, params=params)
+
+    # ★ V3 强力拦截：如果外部调用通用代理时选择了 stock_zh_a_hist
+    # 直接转发到我们在本模块设计的带三重保护（东财+腾讯+新浪）核心接口上，防止直接遭遇东财断流。
+    if func_name == "stock_zh_a_hist":
+        return await stock_zh_a_hist(
+            symbol=params.get("symbol", ""),
+            period=params.get("period", "daily"),
+            start_date=params.get("start_date", ""),
+            end_date=params.get("end_date", ""),
+            adjust=params.get("adjust", "")
+        )
 
     # 安全检查
     if not func_name.startswith(ALLOWED_PREFIXES):
