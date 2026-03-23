@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 """
+Auto-activate venv if running outside it.
+"""
+import os, sys
+_venv_python = os.path.join(os.path.dirname(os.path.abspath(__file__)), "venv", "bin", "python")
+if os.path.exists(_venv_python) and sys.executable != _venv_python and "VIRTUAL_ENV" not in os.environ:
+    os.execv(_venv_python, [_venv_python] + sys.argv)
+
+"""
 AKShare Gateway 全接口测试脚本 v2.0
 
 用途：部署到新服务器后，验证各第三方 API 是否可正常调通。
