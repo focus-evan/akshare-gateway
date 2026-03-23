@@ -960,11 +960,9 @@ def _fetch_stock_detail_tencent(symbol: str) -> pd.DataFrame:
 def _fetch_fund_flow_rank_direct(indicator: str = "今日") -> pd.DataFrame:
     """
     直接 HTTP 调用东方财富资金流向排名 API（绕过 akshare）
-    """
-    headers = _build_browser_headers()
-    headers['Referer'] = 'https://data.eastmoney.com/zjlx/detail.html'
 
-    # indicator 映射到 API 参数
+    使用全新 Session + Connection:close + 多个东财子域名轮试
+    """
     indicator_map = {
         "今日": ("f62", "1"),
         "3日": ("f267", "3"),
@@ -973,118 +971,160 @@ def _fetch_fund_flow_rank_direct(indicator: str = "今日") -> pd.DataFrame:
     }
     sort_field, days = indicator_map.get(indicator, ("f62", "1"))
 
-    try:
-        url = (
-            f"https://push2.eastmoney.com/api/qt/clist/get"
-            f"?fid={sort_field}&po=1&pz=300&pn=1&np=1"
-            f"&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5"
-            f"&fields=f1,f2,f3,f12,f13,f14,f62,f184,f66,f69,f72,f75,f78,f81,f267,f164,f174"
-            f"&fs=m:0+t:6+f:!2,m:0+t:13+f:!2,m:0+t:80+f:!2,m:1+t:2+f:!2,m:1+t:23+f:!2"
-        )
-        resp = requests.get(url, headers=headers, timeout=15)
-        data = resp.json()
+    # 尝试多个东财子域名（push2 被封时换其他子域名）
+    push_domains = [
+        "push2.eastmoney.com",
+        "push2ex.eastmoney.com",
+        "80.push2.eastmoney.com",
+    ]
 
-        if data and data.get('data') and data['data'].get('diff'):
-            items = data['data']['diff']
-            rows = []
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                rows.append({
-                    '代码': item.get('f12', ''),
-                    '名称': item.get('f14', ''),
-                    '最新价': item.get('f2'),
-                    '涨跌幅': item.get('f3'),
-                    '主力净流入': item.get('f62'),
-                    '主力净流入占比': item.get('f184'),
-                    '超大单净流入': item.get('f66'),
-                    '超大单净流入占比': item.get('f69'),
-                    '大单净流入': item.get('f72'),
-                    '大单净流入占比': item.get('f75'),
-                    '中单净流入': item.get('f78'),
-                    '中单净流入占比': item.get('f81'),
-                })
-            if rows:
-                df = pd.DataFrame(rows)
-                logger.info("Direct fund flow rank fetched", rows=len(df))
-                return df
-    except Exception as e:
-        logger.warning("Direct fund flow rank failed", error=str(e))
+    for domain in push_domains:
+        try:
+            # 创建全新 Session，避免复用被标记的连接
+            session = requests.Session()
+            headers = _build_browser_headers()
+            headers['Referer'] = 'https://data.eastmoney.com/zjlx/detail.html'
+            headers['Connection'] = 'close'  # 不复用连接
+
+            url = (
+                f"https://{domain}/api/qt/clist/get"
+                f"?fid={sort_field}&po=1&pz=300&pn=1&np=1"
+                f"&fltt=2&invt=2&ut=b2884a393a59ad64002292a3e90d46a5"
+                f"&fields=f1,f2,f3,f12,f13,f14,f62,f184,f66,f69,f72,f75,f78,f81,f267,f164,f174"
+                f"&fs=m:0+t:6+f:!2,m:0+t:13+f:!2,m:0+t:80+f:!2,m:1+t:2+f:!2,m:1+t:23+f:!2"
+            )
+            resp = session.get(url, headers=headers, timeout=15, verify=True)
+            session.close()
+
+            data = resp.json()
+            if data and data.get('data') and data['data'].get('diff'):
+                items = data['data']['diff']
+                rows = []
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    rows.append({
+                        '代码': item.get('f12', ''),
+                        '名称': item.get('f14', ''),
+                        '最新价': item.get('f2'),
+                        '涨跌幅': item.get('f3'),
+                        '主力净流入': item.get('f62'),
+                        '主力净流入占比': item.get('f184'),
+                        '超大单净流入': item.get('f66'),
+                        '超大单净流入占比': item.get('f69'),
+                        '大单净流入': item.get('f72'),
+                        '大单净流入占比': item.get('f75'),
+                        '中单净流入': item.get('f78'),
+                        '中单净流入占比': item.get('f81'),
+                    })
+                if rows:
+                    df = pd.DataFrame(rows)
+                    logger.info("Direct fund flow rank fetched",
+                                domain=domain, rows=len(df))
+                    return df
+        except Exception as e:
+            logger.warning("Direct fund flow rank failed",
+                           domain=domain, error=str(e)[:150])
+            time.sleep(random.uniform(0.5, 1.5))
+            continue
+
     return pd.DataFrame()
 
 
 def _fetch_concept_cons_direct_em(symbol: str) -> pd.DataFrame:
     """
     直接 HTTP 调用东方财富概念板块成份股 API（绕过 akshare）
+
+    使用全新 Session + Connection:close + 多个东财子域名轮试
     """
-    headers = _build_browser_headers()
-    headers['Referer'] = 'https://data.eastmoney.com/bkzj/BK0493.html'
+    push_domains = [
+        "push2.eastmoney.com",
+        "push2ex.eastmoney.com",
+        "80.push2.eastmoney.com",
+    ]
 
-    try:
-        # 第一步：获取板块代码
-        list_url = (
-            f"https://push2.eastmoney.com/api/qt/clist/get"
-            f"?pn=1&pz=500&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281"
-            f"&fltt=2&invt=2&fid=f3"
-            f"&fs=m:90+t:3+f:!50"
-            f"&fields=f1,f2,f3,f4,f12,f13,f14"
-        )
-        resp = requests.get(list_url, headers=headers, timeout=15)
-        data = resp.json()
+    for domain in push_domains:
+        try:
+            session = requests.Session()
+            headers = _build_browser_headers()
+            headers['Referer'] = 'https://data.eastmoney.com/bkzj/BK0493.html'
+            headers['Connection'] = 'close'
 
-        board_code = None
-        if data and data.get('data') and data['data'].get('diff'):
-            for item in data['data']['diff']:
-                if isinstance(item, dict) and item.get('f14') == symbol:
-                    board_code = item.get('f12')
-                    break
+            # 第一步：获取板块代码
+            list_url = (
+                f"https://{domain}/api/qt/clist/get"
+                f"?pn=1&pz=500&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281"
+                f"&fltt=2&invt=2&fid=f3"
+                f"&fs=m:90+t:3+f:!50"
+                f"&fields=f1,f2,f3,f4,f12,f13,f14"
+            )
+            resp = session.get(list_url, headers=headers, timeout=15, verify=True)
+            data = resp.json()
 
-        if not board_code:
-            logger.warning("Concept board code not found", symbol=symbol)
-            return pd.DataFrame()
+            board_code = None
+            if data and data.get('data') and data['data'].get('diff'):
+                for item in data['data']['diff']:
+                    if isinstance(item, dict) and item.get('f14') == symbol:
+                        board_code = item.get('f12')
+                        break
 
-        # 第二步：用板块代码获取成份股
-        time.sleep(random.uniform(0.3, 0.8))
-        cons_url = (
-            f"https://push2.eastmoney.com/api/qt/clist/get"
-            f"?pn=1&pz=500&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281"
-            f"&fltt=2&invt=2&fid=f3"
-            f"&fs=b:{board_code}+f:!50"
-            f"&fields=f1,f2,f3,f4,f5,f6,f7,f12,f13,f14,f15,f16,f17,f18,f20,f21,f23,f24,f25,f128,f140,f141,f136"
-        )
-        headers2 = _build_browser_headers()
-        headers2['Referer'] = f'https://data.eastmoney.com/bkzj/{board_code}.html'
-        resp2 = requests.get(cons_url, headers=headers2, timeout=15)
-        data2 = resp2.json()
+            if not board_code:
+                logger.warning("Concept board code not found on domain",
+                               domain=domain, symbol=symbol)
+                session.close()
+                continue
 
-        if data2 and data2.get('data') and data2['data'].get('diff'):
-            rows = []
-            for item in data2['data']['diff']:
-                if not isinstance(item, dict):
-                    continue
-                rows.append({
-                    '代码': item.get('f12', ''),
-                    '名称': item.get('f14', ''),
-                    '最新价': item.get('f2'),
-                    '涨跌幅': item.get('f3'),
-                    '涨跌额': item.get('f4'),
-                    '成交量': item.get('f5'),
-                    '成交额': item.get('f6'),
-                    '振幅': item.get('f7'),
-                    '最高': item.get('f15'),
-                    '最低': item.get('f16'),
-                    '今开': item.get('f17'),
-                    '昨收': item.get('f18'),
-                    '换手率': item.get('f23'),
-                    '市盈率': item.get('f24') if item.get('f24') else None,
-                    '市净率': item.get('f25') if item.get('f25') else None,
-                })
-            if rows:
-                df = pd.DataFrame(rows)
-                logger.info("Direct concept cons fetched", symbol=symbol, rows=len(df))
-                return df
-    except Exception as e:
-        logger.warning("Direct concept cons failed", symbol=symbol, error=str(e))
+            # 第二步：用板块代码获取成份股
+            time.sleep(random.uniform(0.5, 1.5))
+            headers2 = _build_browser_headers()
+            headers2['Referer'] = f'https://data.eastmoney.com/bkzj/{board_code}.html'
+            headers2['Connection'] = 'close'
+
+            cons_url = (
+                f"https://{domain}/api/qt/clist/get"
+                f"?pn=1&pz=500&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281"
+                f"&fltt=2&invt=2&fid=f3"
+                f"&fs=b:{board_code}+f:!50"
+                f"&fields=f1,f2,f3,f4,f5,f6,f7,f12,f13,f14,f15,f16,f17,f18,f20,f21,f23,f24,f25,f128,f140,f141,f136"
+            )
+            resp2 = session.get(cons_url, headers=headers2, timeout=15, verify=True)
+            session.close()
+
+            data2 = resp2.json()
+            if data2 and data2.get('data') and data2['data'].get('diff'):
+                rows = []
+                for item in data2['data']['diff']:
+                    if not isinstance(item, dict):
+                        continue
+                    rows.append({
+                        '代码': item.get('f12', ''),
+                        '名称': item.get('f14', ''),
+                        '最新价': item.get('f2'),
+                        '涨跌幅': item.get('f3'),
+                        '涨跌额': item.get('f4'),
+                        '成交量': item.get('f5'),
+                        '成交额': item.get('f6'),
+                        '振幅': item.get('f7'),
+                        '最高': item.get('f15'),
+                        '最低': item.get('f16'),
+                        '今开': item.get('f17'),
+                        '昨收': item.get('f18'),
+                        '换手率': item.get('f23'),
+                        '市盈率': item.get('f24') if item.get('f24') else None,
+                        '市净率': item.get('f25') if item.get('f25') else None,
+                    })
+                if rows:
+                    df = pd.DataFrame(rows)
+                    logger.info("Direct concept cons fetched",
+                                domain=domain, symbol=symbol, rows=len(df))
+                    return df
+
+        except Exception as e:
+            logger.warning("Direct concept cons failed on domain",
+                           domain=domain, symbol=symbol, error=str(e)[:150])
+            time.sleep(random.uniform(1.0, 2.0))
+            continue
+
     return pd.DataFrame()
 
 
@@ -1436,24 +1476,60 @@ async def stock_individual_fund_flow_rank(
     """
     获取个股资金流向排名
 
-    数据源优先级: akshare东财接口 → 直连东财push2 API
+    数据源优先级: akshare东财接口 → 直连东财多域名API
+    关键优化: 每个数据源之间重置反爬计数器,避免累积惩罚
     """
     start = time.time()
     func_name = "stock_individual_fund_flow_rank"
+
+    # 检查缓存
+    cache_name = f"{func_name}:{indicator}"
+    cache_k = _cache_key(cache_name)
+    cached = cache.get(cache_k)
+    if cached is not None:
+        _record_stat(func_name, (time.time() - start) * 1000, cache_hit=True)
+        return _df_to_response(cached)
+
+    # 数据源1: akshare 接口
     try:
-        df = _multi_source_call(
-            sources=[
-                ("akshare_em", ak.stock_individual_fund_flow_rank, {"indicator": indicator}),
-                ("direct_em", _fetch_fund_flow_rank_direct, {"indicator": indicator}),
-            ],
-            cache_name=f"{func_name}:{indicator}",
-        )
-        _record_stat(func_name, (time.time() - start) * 1000)
-        return _df_to_response(df)
+        _smart_rate_limit()
+        df = _retry(ak.stock_individual_fund_flow_rank, max_retries=2,
+                     delay=1.5, indicator=indicator)
+        if df is not None and not df.empty:
+            cache.set(cache_k, df, _get_ttl(func_name))
+            _record_stat(func_name, (time.time() - start) * 1000)
+            return _df_to_response(df)
     except Exception as e:
-        _record_stat(func_name, (time.time() - start) * 1000, is_error=True)
-        logger.error("资金流排名全部数据源失败", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.warning("akshare资金流排名失败", error=str(e)[:150])
+
+    # ★ 关键: 重置反爬计数器 + 连接池,让后续数据源不受前面失败的影响
+    _record_success()
+    _reset_connections()
+    time.sleep(random.uniform(2.0, 4.0))  # 等待一段时间再用新连接
+
+    # 数据源2: 直连东财多域名API（全新Session,不经过patched session）
+    try:
+        df = _fetch_fund_flow_rank_direct(indicator)
+        if df is not None and not df.empty:
+            cache.set(cache_k, df, _get_ttl(func_name))
+            _record_stat(func_name, (time.time() - start) * 1000)
+            _record_success()
+            return _df_to_response(df)
+    except Exception as e:
+        logger.warning("直连资金流排名失败", error=str(e)[:150])
+
+    # 所有数据源失败,尝试过期缓存
+    with cache._lock:
+        if cache_k in cache._store:
+            stale_data, _ = cache._store[cache_k]
+            logger.warning("资金流排名返回过期缓存")
+            _record_stat(func_name, (time.time() - start) * 1000)
+            return _df_to_response(stale_data)
+
+    _record_stat(func_name, (time.time() - start) * 1000, is_error=True)
+    logger.error("资金流排名全部数据源失败", indicator=indicator)
+    raise HTTPException(status_code=500,
+                        detail="资金流排名所有数据源失败,请稍后重试")
 
 
 # =====================================================================
@@ -1530,54 +1606,78 @@ async def stock_board_concept_cons_em(
     """
     获取概念板块成份股
 
-    数据源优先级: 东方财富akshare → 直连东财push2 API → 同花顺
+    数据源优先级: 东方财富akshare → 直连东财多域名API → 同花顺
+    关键优化: 每个数据源之间重置反爬计数器,避免累积惩罚
     """
     start = time.time()
     func_name = "stock_board_concept_cons_em"
+    cache_k = _cache_key(f"{func_name}:{symbol}")
+
+    # 检查缓存
+    cached = cache.get(cache_k)
+    if cached is not None:
+        _record_stat(func_name, (time.time() - start) * 1000, cache_hit=True)
+        return _df_to_response(cached)
+
     try:
         # 数据源1: akshare东财接口
         try:
             _smart_rate_limit()
-            df = _retry(ak.stock_board_concept_cons_em, max_retries=2, delay=2.0, symbol=symbol)
+            df = _retry(ak.stock_board_concept_cons_em, max_retries=2,
+                         delay=2.0, symbol=symbol)
             if df is not None and not df.empty:
-                cache.set(_cache_key(f"{func_name}:{symbol}"), df, 300)
+                cache.set(cache_k, df, 300)
                 _record_stat(func_name, (time.time() - start) * 1000)
                 return _df_to_response(df)
         except Exception as em_err:
-            logger.warning("东财akshare概念成份失败", symbol=symbol, error=str(em_err))
+            logger.warning("东财akshare概念成份失败",
+                           symbol=symbol, error=str(em_err)[:150])
 
-        # 数据源2: 直连东财push2 API（绕过akshare,用不同的请求头和URL）
+        # ★ 关键: 重置反爬计数器 + 连接池
+        _record_success()
+        _reset_connections()
+        time.sleep(random.uniform(2.0, 4.0))
+
+        # 数据源2: 直连东财多域名API（全新Session）
         try:
-            _smart_rate_limit()
             df = _fetch_concept_cons_direct_em(symbol)
             if df is not None and not df.empty:
-                cache.set(_cache_key(f"{func_name}:{symbol}"), df, 300)
+                cache.set(cache_k, df, 300)
                 _record_stat(func_name, (time.time() - start) * 1000)
+                _record_success()
                 logger.info("概念成份直连API成功", symbol=symbol, rows=len(df))
                 return _df_to_response(df)
         except Exception as direct_err:
-            logger.warning("直连东财概念成份失败", symbol=symbol, error=str(direct_err))
+            logger.warning("直连东财概念成份失败",
+                           symbol=symbol, error=str(direct_err)[:150])
+
+        # ★ 再次重置,为THS源清理状态
+        _record_success()
+        _reset_connections()
+        time.sleep(random.uniform(1.0, 2.0))
 
         # 数据源3: 同花顺备用（动态查找函数名）
-        _smart_rate_limit()
         for ths_name in ['stock_board_concept_cons_ths', 'stock_board_cons_ths']:
             ths_func = getattr(ak, ths_name, None)
             if ths_func is not None:
                 try:
-                    df = _retry(ths_func, max_retries=2, delay=1.5, symbol=symbol)
+                    df = _retry(ths_func, max_retries=2, delay=1.5,
+                                 symbol=symbol)
                     if df is not None and not df.empty:
-                        cache.set(_cache_key(f"{func_name}:{symbol}"), df, 300)
+                        cache.set(cache_k, df, 300)
                         _record_stat(func_name, (time.time() - start) * 1000)
+                        _record_success()
                         return _df_to_response(df)
                 except Exception as ths_err:
-                    logger.warning(f"{ths_name} failed", error=str(ths_err))
+                    logger.warning(f"{ths_name} failed",
+                                   error=str(ths_err)[:150])
 
         # 最后尝试过期缓存
-        stale_key = _cache_key(f"{func_name}:{symbol}")
         with cache._lock:
-            if stale_key in cache._store:
-                stale_data, _ = cache._store[stale_key]
+            if cache_k in cache._store:
+                stale_data, _ = cache._store[cache_k]
                 logger.warning("概念成份返回过期缓存", symbol=symbol)
+                _record_stat(func_name, (time.time() - start) * 1000)
                 return _df_to_response(stale_data)
 
         raise Exception(f"概念成份股所有数据源失败: {symbol}")
