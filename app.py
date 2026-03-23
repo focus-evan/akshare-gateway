@@ -758,18 +758,32 @@ def _tencent_kline(symbol: str, start_date: str = "",
 
     try:
         resp = requests.get(url, headers=headers, timeout=15)
-        data = resp.json()
+        raw = resp.json()
 
-        # 解析腾讯K线数据
-        klines = data.get('data', {}).get(f'{prefix}{symbol}', {})
-        day_data = klines.get(fq + 'day', klines.get('day', []))
+        # 解析腾讯K线数据 — data 可能是 dict 或 list
+        data_obj = raw.get('data', {})
+        if isinstance(data_obj, list):
+            # 部分接口返回 list 格式
+            klines = data_obj[0] if data_obj else {}
+            if isinstance(klines, dict):
+                klines = klines.get(f'{prefix}{symbol}', klines)
+        elif isinstance(data_obj, dict):
+            klines = data_obj.get(f'{prefix}{symbol}', {})
+        else:
+            klines = {}
+
+        if isinstance(klines, dict):
+            day_data = klines.get(fq + 'day', klines.get('day',
+                         klines.get('qfqday', klines.get('hfqday', []))))
+        else:
+            day_data = []
 
         if not day_data:
             return pd.DataFrame()
 
         rows = []
         for item in day_data:
-            if len(item) >= 6:
+            if isinstance(item, (list, tuple)) and len(item) >= 5:
                 rows.append({
                     '日期': item[0],
                     '开盘': float(item[1]),

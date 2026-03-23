@@ -253,16 +253,27 @@ def test_alternative_sources(fast: bool = False) -> List[Dict]:
     try:
         start = time.time()
         url = "https://hq.sinajs.cn/list=sh600519,sz000001"
-        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"}
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://finance.sina.com.cn/",
+        }
         resp = _req.get(url, headers=headers, timeout=10)
         resp.encoding = 'gbk'
         elapsed = time.time() - start
-        if '贵州茅台' in resp.text or 'hq_str' in resp.text:
+        text = resp.text
+        # sinajs 可能返回空字符串""或只有变量名无数据
+        has_data = ('hq_str' in text and len(text) > 50 and
+                    ('贵州茅台' in text or '平安银行' in text or ',' in text.split('"')[1] if '"' in text else False))
+        if has_data:
             _ok(f"新浪实时报价(sinajs)  —  OK  ({elapsed:.1f}s)")
             results.append({"name": "sina_hq_sinajs", "status": "PASS"})
             passed += 1
+        elif resp.status_code == 200 and 'hq_str' in text:
+            _warn(f"新浪实时报价(sinajs)  —  可达但数据受限（非交易时段）  ({elapsed:.1f}s)")
+            results.append({"name": "sina_hq_sinajs", "status": "WARN"})
+            passed += 1  # 可达就算通过
         else:
-            _fail(f"新浪实时报价(sinajs)  —  异常响应  ({elapsed:.1f}s)")
+            _fail(f"新浪实时报价(sinajs)  —  HTTP {resp.status_code}  ({elapsed:.1f}s)")
             results.append({"name": "sina_hq_sinajs", "status": "FAIL"})
             failed += 1
     except Exception as e:
@@ -306,12 +317,30 @@ def test_alternative_sources(fast: bool = False) -> List[Dict]:
         start = time.time()
         url = (f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
                f"?param=sh600519,day,{start_str},{today_str},30,qfq")
-        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://stockapp.finance.qq.com/"}
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                   "Referer": "https://stockapp.finance.qq.com/"}
         resp = _req.get(url, headers=headers, timeout=15)
-        data = resp.json()
+        raw = resp.json()
         elapsed = time.time() - start
-        klines = data.get('data', {}).get('sh600519', {})
-        day_data = klines.get('qfqday', klines.get('day', []))
+
+        # 解析 — data 可能是 dict 或 list
+        data_obj = raw.get('data', {})
+        if isinstance(data_obj, list):
+            klines = data_obj[0] if data_obj else {}
+            if isinstance(klines, dict):
+                klines = klines.get('sh600519', klines)
+        elif isinstance(data_obj, dict):
+            klines = data_obj.get('sh600519', {})
+        else:
+            klines = {}
+
+        day_data = []
+        if isinstance(klines, dict):
+            for key in ['qfqday', 'day', 'qfq']:
+                day_data = klines.get(key, [])
+                if day_data:
+                    break
+
         if day_data and len(day_data) > 0:
             _ok(f"腾讯K线(HTTP直连)  —  {len(day_data)} 天  ({elapsed:.1f}s)")
             results.append({"name": "tencent_kline_http", "status": "PASS", "rows": len(day_data)})

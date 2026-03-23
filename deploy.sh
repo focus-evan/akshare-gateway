@@ -339,6 +339,10 @@ configure_firewall() {
 
 start_service() {
     log_section "启动服务"
+    # 先停止旧服务（确保新代码生效）
+    systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
+    sleep 1
+    systemctl daemon-reload
     systemctl enable "${SERVICE_NAME}"
     systemctl start "${SERVICE_NAME}"
     sleep 2
