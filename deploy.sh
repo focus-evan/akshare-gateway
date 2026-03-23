@@ -247,7 +247,7 @@ After=network.target
 Wants=network-online.target
 
 [Service]
-Type=notify
+Type=simple
 User=root
 Group=root
 WorkingDirectory=${DEPLOY_DIR}
@@ -260,8 +260,7 @@ ExecStart=${VENV_DIR}/bin/gunicorn app:app \\
     --keep-alive 5 \\
     --access-logfile ${LOG_DIR}/access.log \\
     --error-logfile ${LOG_DIR}/error.log \\
-    --capture-output \\
-    --enable-stdio-inheritance
+    --capture-output
 
 ExecReload=/bin/kill -s HUP \$MAINPID
 ExecStop=/bin/kill -s TERM \$MAINPID
@@ -270,6 +269,7 @@ ExecStop=/bin/kill -s TERM \$MAINPID
 Environment="TZ=Asia/Shanghai"
 Environment="PYTHONUNBUFFERED=1"
 Environment="PYTHONDONTWRITEBYTECODE=1"
+Environment="LANG=en_US.UTF-8"
 
 # 自动重启
 Restart=always
@@ -277,14 +277,12 @@ RestartSec=5
 StartLimitBurst=5
 StartLimitIntervalSec=60
 
-# 资源限制
+# 文件描述符限制
 LimitNOFILE=65536
-MemoryMax=2G
-CPUQuota=200%
 
 # 日志配置
-StandardOutput=append:${LOG_DIR}/stdout.log
-StandardError=append:${LOG_DIR}/stderr.log
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
