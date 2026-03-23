@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 AKShare Gateway 全接口测试脚本 v2.0
 
