@@ -77,54 +77,92 @@ install_system_deps() {
     # 检测包管理器
     if command -v apt-get &>/dev/null; then
         PKG_MGR="apt"
-    elif command -v yum &>/dev/null; then
-        PKG_MGR="yum"
     elif command -v dnf &>/dev/null; then
         PKG_MGR="dnf"
+    elif command -v yum &>/dev/null; then
+        PKG_MGR="yum"
     else
-        log_error "不支持的包管理器，请手动安装 Python 3.10+ 和 Git"
+        log_error "不支持的包管理器，请手动安装 Python 3.8+ 和 Git"
         exit 1
     fi
 
     log_info "包管理器: ${PKG_MGR}"
+    log_info "系统: $(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d= -f2 | tr -d '\"' || uname -a)"
 
+    # 安装基础工具
     if [ "$PKG_MGR" = "apt" ]; then
         apt-get update -y
         apt-get install -y python3 python3-pip python3-venv git curl
-    elif [ "$PKG_MGR" = "yum" ]; then
-        yum install -y python3 python3-pip git curl
-        # CentOS 7 可能需要额外安装 venv
-        yum install -y python3-virtualenv 2>/dev/null || true
     elif [ "$PKG_MGR" = "dnf" ]; then
-        dnf install -y python3 python3-pip git curl
+        dnf install -y python3 python3-pip python3-devel git curl gcc
+    elif [ "$PKG_MGR" = "yum" ]; then
+        yum install -y python3 python3-pip python3-devel git curl gcc
     fi
 
-    # 验证 Python 版本
+    # 检测当前 Python 版本
     PYTHON_VERSION=$(python3 --version 2>&1 | awk '{print $2}')
     PYTHON_MAJOR=$(echo "$PYTHON_VERSION" | cut -d. -f1)
     PYTHON_MINOR=$(echo "$PYTHON_VERSION" | cut -d. -f2)
+    PYTHON_CMD="python3"
 
-    if [ "$PYTHON_MAJOR" -lt 3 ] || ([ "$PYTHON_MAJOR" -eq 3 ] && [ "$PYTHON_MINOR" -lt 10 ]); then
-        log_warn "Python ${PYTHON_VERSION} 版本偏低，建议 3.10+，尝试安装新版本..."
+    log_info "当前 Python: ${PYTHON_VERSION}"
+
+    # Python 3.8+ 即可运行（requirements.txt 已放宽版本限制）
+    if [ "$PYTHON_MAJOR" -ge 3 ] && [ "$PYTHON_MINOR" -ge 8 ]; then
+        log_info "Python ${PYTHON_VERSION} 满足要求 ✅"
+    else
+        log_warn "Python ${PYTHON_VERSION} 版本过低（需要 3.8+），尝试安装更新版本..."
 
         if [ "$PKG_MGR" = "apt" ]; then
+            # Ubuntu/Debian — 通过 deadsnakes PPA
             apt-get install -y software-properties-common
             add-apt-repository -y ppa:deadsnakes/ppa 2>/dev/null || true
             apt-get update -y
-            apt-get install -y python3.11 python3.11-venv python3.11-pip 2>/dev/null || true
-            if command -v python3.11 &>/dev/null; then
-                PYTHON_CMD="python3.11"
-            else
-                PYTHON_CMD="python3"
+            apt-get install -y python3.11 python3.11-venv python3.11-distutils 2>/dev/null || \
+            apt-get install -y python3.10 python3.10-venv python3.10-distutils 2>/dev/null || true
+
+        elif [ "$PKG_MGR" = "dnf" ] || [ "$PKG_MGR" = "yum" ]; then
+            # CentOS/RHEL/Alibaba Cloud Linux — 尝试多种方式
+            # 方法1: 从 AppStream/EPEL 安装
+            ${PKG_MGR} install -y python3.11 python3.11-pip python3.11-devel 2>/dev/null || \
+            ${PKG_MGR} install -y python3.10 python3.10-pip python3.10-devel 2>/dev/null || \
+            ${PKG_MGR} install -y python39 python39-pip python39-devel 2>/dev/null || true
+
+            # 方法2: 如果上面没装上，尝试启用 CRB/PowerTools
+            if ! command -v python3.11 &>/dev/null && ! command -v python3.10 &>/dev/null; then
+                ${PKG_MGR} install -y epel-release 2>/dev/null || true
+                ${PKG_MGR} install -y python3.11 2>/dev/null || \
+                ${PKG_MGR} install -y python3.10 2>/dev/null || true
             fi
-        else
-            PYTHON_CMD="python3"
         fi
-    else
-        PYTHON_CMD="python3"
+
+        # 找到最佳可用的 Python
+        for PY in python3.11 python3.10 python3.9 python3; do
+            if command -v "$PY" &>/dev/null; then
+                PY_VER=$($PY --version 2>&1 | awk '{print $2}')
+                PY_MINOR=$(echo "$PY_VER" | cut -d. -f2)
+                if [ "$PY_MINOR" -ge 8 ]; then
+                    PYTHON_CMD="$PY"
+                    log_info "使用 ${PY} (${PY_VER})"
+                    break
+                fi
+            fi
+        done
     fi
 
-    log_info "Python: $(${PYTHON_CMD} --version)"
+    # 确保 venv 模块可用
+    ${PYTHON_CMD} -m venv --help &>/dev/null 2>&1 || {
+        log_warn "venv 模块不可用，尝试安装..."
+        if [ "$PKG_MGR" = "apt" ]; then
+            apt-get install -y python3-venv 2>/dev/null || true
+        elif [ "$PKG_MGR" = "dnf" ] || [ "$PKG_MGR" = "yum" ]; then
+            ${PKG_MGR} install -y python3-virtualenv 2>/dev/null || true
+        fi
+    }
+
+    # 最终验证
+    FINAL_VERSION=$(${PYTHON_CMD} --version 2>&1)
+    log_info "最终 Python: ${FINAL_VERSION}"
     log_info "Git: $(git --version)"
 }
 
