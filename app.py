@@ -604,6 +604,242 @@ _start_cache_cleanup()
 
 
 # =====================================================================
+#  多数据源备用引擎 (Multi-Source Fallback Engine)
+# =====================================================================
+#  当东财(Eastmoney)被反爬时，自动切换到新浪/腾讯/同花顺等数据源
+# =====================================================================
+
+def _multi_source_call(sources: list, cache_name: str = None,
+                       cache_ttl: float = None) -> pd.DataFrame:
+    """
+    多数据源调用，按优先级依次尝试，直到成功
+
+    Args:
+        sources: [(source_name, callable, kwargs_dict), ...]
+        cache_name: 缓存使用的键名（统一缓存，不区分数据源）
+        cache_ttl: 缓存 TTL，默认使用 CACHE_TTL 配置
+    Returns:
+        pd.DataFrame
+    """
+    # 检查缓存
+    if cache_name:
+        key = _cache_key(cache_name)
+        cached = cache.get(key)
+        if cached is not None:
+            logger.debug("Multi-source cache hit", key=cache_name)
+            return cached
+
+    last_err = None
+    for source_name, func, kwargs in sources:
+        try:
+            _smart_rate_limit()
+            logger.info("Trying data source", source=source_name)
+            df = _retry(func, max_retries=2, delay=1.5, **kwargs)
+            if df is not None and not df.empty:
+                # 缓存结果
+                if cache_name:
+                    ttl = cache_ttl or _get_ttl(cache_name)
+                    cache.set(_cache_key(cache_name), df, ttl)
+                logger.info("Data source success", source=source_name,
+                            rows=len(df))
+                _record_stat(cache_name or source_name,
+                             0, cache_hit=False)
+                return df
+            else:
+                logger.warning("Data source returned empty",
+                               source=source_name)
+        except Exception as e:
+            last_err = e
+            logger.warning("Data source failed, trying next",
+                           source=source_name, error=str(e)[:200])
+            continue
+
+    # 所有数据源都失败，尝试过期缓存
+    if cache_name:
+        key = _cache_key(cache_name)
+        with cache._lock:
+            if key in cache._store:
+                stale_data, _ = cache._store[key]
+                logger.warning("All sources failed, returning stale cache",
+                               cache_name=cache_name)
+                return stale_data
+
+    if last_err:
+        raise last_err
+    raise Exception("All data sources failed and no cache available")
+
+
+# ---- 新浪财经直连 ----
+
+def _sina_a_spot() -> pd.DataFrame:
+    """
+    新浪财经 A 股实时行情 — 直接 HTTP 调用
+    绕过 akshare，直接调用新浪 API
+    """
+    all_data = []
+    headers = _build_browser_headers()
+    headers['Referer'] = 'https://finance.sina.com.cn/stock/'
+
+    for page in range(1, 8):  # 最多取7页 ≈ 5000只
+        url = (
+            f"https://vip.stock.finance.sina.com.cn/quotes_service/api/"
+            f"json_v2.php/Market_Center.getHQNodeData"
+            f"?page={page}&num=1000&sort=changepercent&asc=0"
+            f"&node=hs_a&symbol=&_s_r_a=auto"
+        )
+        try:
+            resp = requests.get(url, headers=headers, timeout=15)
+            if resp.status_code != 200:
+                break
+            data = resp.json()
+            if not data:
+                break
+            all_data.extend(data)
+        except Exception as e:
+            logger.warning("Sina spot page failed", page=page, error=str(e))
+            break
+        time.sleep(random.uniform(0.3, 0.8))
+
+    if not all_data:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_data)
+    # 重命名列以匹配东财格式
+    col_map = {
+        'symbol': '代码', 'code': '代码', 'name': '名称',
+        'trade': '最新价', 'pricechange': '涨跌额',
+        'changepercent': '涨跌幅', 'buy': '买入', 'sell': '卖出',
+        'settlement': '昨收', 'open': '今开', 'high': '最高',
+        'low': '最低', 'volume': '成交量', 'amount': '成交额',
+        'ticktime': '更新时间', 'turnoverratio': '换手率',
+    }
+    df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+    logger.info("Sina A-spot fetched", rows=len(df))
+    return df
+
+
+def _sina_stock_hist(symbol: str, start_date: str = "",
+                     end_date: str = "", **kwargs) -> pd.DataFrame:
+    """
+    新浪财经个股日K线 — 通过 akshare 的新浪接口
+    """
+    try:
+        # akshare 的新浪日K线接口
+        func = getattr(ak, 'stock_zh_a_daily', None)
+        if func:
+            ak_kwargs = {"symbol": f"sz{symbol}" if symbol.startswith(('0', '3')) else f"sh{symbol}"}
+            if start_date:
+                ak_kwargs["start_date"] = start_date
+            if end_date:
+                ak_kwargs["end_date"] = end_date
+            ak_kwargs["adjust"] = kwargs.get("adjust", "qfq")
+            return func(**ak_kwargs)
+    except Exception as e:
+        logger.warning("Sina stock_zh_a_daily failed", symbol=symbol, error=str(e))
+
+    return pd.DataFrame()
+
+
+def _tencent_kline(symbol: str, start_date: str = "",
+                   end_date: str = "", **kwargs) -> pd.DataFrame:
+    """
+    腾讯财经个股日K线 — 直接 HTTP 调用
+    """
+    headers = _build_browser_headers()
+    headers['Referer'] = 'https://stockapp.finance.qq.com/'
+
+    prefix = "sz" if symbol.startswith(('0', '3')) else "sh"
+    fq = kwargs.get("adjust", "qfq")
+
+    url = (
+        f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+        f"?param={prefix}{symbol},day,{start_date},{end_date},500,{fq}"
+    )
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        data = resp.json()
+
+        # 解析腾讯K线数据
+        klines = data.get('data', {}).get(f'{prefix}{symbol}', {})
+        day_data = klines.get(fq + 'day', klines.get('day', []))
+
+        if not day_data:
+            return pd.DataFrame()
+
+        rows = []
+        for item in day_data:
+            if len(item) >= 6:
+                rows.append({
+                    '日期': item[0],
+                    '开盘': float(item[1]),
+                    '收盘': float(item[2]),
+                    '最高': float(item[3]),
+                    '最低': float(item[4]),
+                    '成交量': float(item[5]) if len(item) > 5 else 0,
+                })
+
+        df = pd.DataFrame(rows)
+        logger.info("Tencent kline fetched", symbol=symbol, rows=len(df))
+        return df
+
+    except Exception as e:
+        logger.warning("Tencent kline failed", symbol=symbol, error=str(e))
+        return pd.DataFrame()
+
+
+def _sina_hk_spot() -> pd.DataFrame:
+    """
+    新浪财经港股实时行情 — 通过 akshare
+    """
+    try:
+        func = getattr(ak, 'stock_hk_spot', None)
+        if func:
+            return func()
+    except Exception as e:
+        logger.warning("Sina HK spot failed", error=str(e))
+    return pd.DataFrame()
+
+
+def _fetch_stock_detail_sina(symbol: str) -> pd.DataFrame:
+    """
+    新浪财经个股详情 — 直接 HTTP 调用
+    """
+    headers = _build_browser_headers()
+    headers['Referer'] = 'https://finance.sina.com.cn/'
+
+    prefix = "sz" if symbol.startswith(('0', '3')) else "sh"
+    url = f"https://hq.sinajs.cn/list={prefix}{symbol}"
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.encoding = 'gbk'
+        text = resp.text
+        # 解析: var hq_str_sh600519="贵州茅台,1749.00,...";
+        parts = text.split('"')[1].split(',') if '"' in text else []
+        if len(parts) >= 32:
+            data = {
+                'item': ['名称', '今开', '昨收', '最新价', '最高', '最低',
+                          '买入', '卖出', '成交量', '成交额', '日期', '时间'],
+                'value': [parts[0], parts[1], parts[2], parts[3], parts[4],
+                          parts[5], parts[6], parts[7], parts[8], parts[9],
+                          parts[30], parts[31]]
+            }
+            return pd.DataFrame(data)
+    except Exception as e:
+        logger.warning("Sina stock detail failed", symbol=symbol, error=str(e))
+    return pd.DataFrame()
+
+
+# 数据源反爬域名扩展（确保覆盖新浪/腾讯/同花顺）
+_REFERER_POOL.extend([
+    "https://finance.sina.com.cn/",
+    "https://stockapp.finance.qq.com/",
+    "https://data.10jqka.com.cn/",
+])
+
+
+# =====================================================================
 #  健康检查 & 监控
 # =====================================================================
 
@@ -682,30 +918,25 @@ async def reset_anti_scrape():
 @app.get("/api/stock/zh_a_spot_em")
 async def stock_zh_a_spot_em():
     """
-    获取沪深京 A 股实时行情（东方财富）
+    获取沪深京 A 股实时行情
 
-    对应 akshare: ak.stock_zh_a_spot_em()
+    数据源优先级: 东方财富 → 新浪财经
     """
     start = time.time()
     func_name = "stock_zh_a_spot_em"
     try:
-        key = _cache_key(func_name)
-        cached = cache.get(key)
-        if cached is not None:
-            _record_stat(func_name, (time.time() - start) * 1000, cache_hit=True)
-            return _df_to_response(cached)
-
-        logger.info("Fetching stock_zh_a_spot_em")
-        _smart_rate_limit()
-        df = _retry(ak.stock_zh_a_spot_em)
-        if df is not None and not df.empty:
-            cache.set(key, df, _get_ttl(func_name))
+        df = _multi_source_call(
+            sources=[
+                ("eastmoney", ak.stock_zh_a_spot_em, {}),
+                ("sina", _sina_a_spot, {}),
+            ],
+            cache_name=func_name,
+        )
         _record_stat(func_name, (time.time() - start) * 1000)
-        logger.info("stock_zh_a_spot_em success", count=len(df) if df is not None else 0)
         return _df_to_response(df)
     except Exception as e:
         _record_stat(func_name, (time.time() - start) * 1000, is_error=True)
-        logger.error("stock_zh_a_spot_em failed", error=str(e))
+        logger.error("A股行情全部数据源失败", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -718,18 +949,23 @@ async def stock_hk_spot_em():
     """
     获取港股实时行情
 
-    对应 akshare: ak.stock_hk_spot_em()
+    数据源优先级: 东方财富 → 新浪财经
     """
     start = time.time()
     func_name = "stock_hk_spot_em"
     try:
-        df = _cached_call(func_name, ak.stock_hk_spot_em)
+        df = _multi_source_call(
+            sources=[
+                ("eastmoney", ak.stock_hk_spot_em, {}),
+                ("sina", _sina_hk_spot, {}),
+            ],
+            cache_name=func_name,
+        )
         _record_stat(func_name, (time.time() - start) * 1000)
-        logger.info("stock_hk_spot_em success", count=len(df) if df is not None else 0)
         return _df_to_response(df)
     except Exception as e:
         _record_stat(func_name, (time.time() - start) * 1000, is_error=True)
-        logger.error("stock_hk_spot_em failed", error=str(e))
+        logger.error("港股行情全部数据源失败", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -748,23 +984,35 @@ async def stock_zh_a_hist(
     """
     获取个股历史K线数据
 
-    对应 akshare: ak.stock_zh_a_hist(symbol, period, start_date, end_date, adjust)
+    数据源优先级: 东方财富 → 新浪财经 → 腾讯财经
     """
     start = time.time()
     func_name = "stock_zh_a_hist"
     try:
-        kwargs = {"symbol": symbol, "period": period, "adjust": adjust}
+        em_kwargs = {"symbol": symbol, "period": period, "adjust": adjust}
         if start_date:
-            kwargs["start_date"] = start_date
+            em_kwargs["start_date"] = start_date
         if end_date:
-            kwargs["end_date"] = end_date
-        df = _cached_call(func_name, ak.stock_zh_a_hist, **kwargs)
+            em_kwargs["end_date"] = end_date
+
+        sina_kwargs = {"symbol": symbol, "start_date": start_date,
+                       "end_date": end_date, "adjust": adjust}
+        tencent_kwargs = {"symbol": symbol, "start_date": start_date,
+                          "end_date": end_date, "adjust": adjust}
+
+        df = _multi_source_call(
+            sources=[
+                ("eastmoney", ak.stock_zh_a_hist, em_kwargs),
+                ("sina", _sina_stock_hist, sina_kwargs),
+                ("tencent", _tencent_kline, tencent_kwargs),
+            ],
+            cache_name=f"{func_name}:{symbol}:{period}:{adjust}",
+        )
         _record_stat(func_name, (time.time() - start) * 1000)
-        logger.info("stock_zh_a_hist success", symbol=symbol, count=len(df) if df is not None else 0)
         return _df_to_response(df)
     except Exception as e:
         _record_stat(func_name, (time.time() - start) * 1000, is_error=True)
-        logger.error("stock_zh_a_hist failed", symbol=symbol, error=str(e))
+        logger.error("K线全部数据源失败", symbol=symbol, error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -813,19 +1061,25 @@ async def stock_individual_info_em(
     symbol: str = Query(..., description="股票代码，如 600519"),
 ):
     """
-    获取个股详细信息（总市值、流通市值、行业、上市日期等）
+    获取个股详细信息
 
-    对应 akshare: ak.stock_individual_info_em(symbol)
+    数据源优先级: 东方财富 → 新浪财经
     """
     start = time.time()
     func_name = "stock_individual_info_em"
     try:
-        df = _cached_call(func_name, ak.stock_individual_info_em, symbol=symbol)
+        df = _multi_source_call(
+            sources=[
+                ("eastmoney", ak.stock_individual_info_em, {"symbol": symbol}),
+                ("sina", _fetch_stock_detail_sina, {"symbol": symbol}),
+            ],
+            cache_name=f"{func_name}:{symbol}",
+        )
         _record_stat(func_name, (time.time() - start) * 1000)
         return _df_to_response(df)
     except Exception as e:
         _record_stat(func_name, (time.time() - start) * 1000, is_error=True)
-        logger.error("stock_individual_info_em failed", symbol=symbol, error=str(e))
+        logger.error("个股详情全部数据源失败", symbol=symbol, error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -926,16 +1180,26 @@ async def stock_zt_pool_dtgc_em(
 
 @app.get("/api/stock/board_concept_name_em")
 async def stock_board_concept_name_em():
-    """获取东方财富概念板块列表"""
+    """
+    获取概念板块列表
+
+    数据源优先级: 东方财富 → 同花顺
+    """
     start = time.time()
     func_name = "stock_board_concept_name_em"
     try:
-        df = _cached_call(func_name, ak.stock_board_concept_name_em)
+        df = _multi_source_call(
+            sources=[
+                ("eastmoney", ak.stock_board_concept_name_em, {}),
+                ("ths", ak.stock_board_concept_name_ths, {}),
+            ],
+            cache_name=func_name,
+        )
         _record_stat(func_name, (time.time() - start) * 1000)
         return _df_to_response(df)
     except Exception as e:
         _record_stat(func_name, (time.time() - start) * 1000, is_error=True)
-        logger.error("stock_board_concept_name_em failed", error=str(e))
+        logger.error("概念板块全部数据源失败", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -943,16 +1207,26 @@ async def stock_board_concept_name_em():
 async def stock_board_concept_cons_em(
     symbol: str = Query(..., description="概念板块名称"),
 ):
-    """获取东方财富概念板块成份股"""
+    """
+    获取概念板块成份股
+
+    数据源优先级: 东方财富 → 同花顺
+    """
     start = time.time()
     func_name = "stock_board_concept_cons_em"
     try:
-        df = _cached_call(func_name, ak.stock_board_concept_cons_em, symbol=symbol)
+        df = _multi_source_call(
+            sources=[
+                ("eastmoney", ak.stock_board_concept_cons_em, {"symbol": symbol}),
+                ("ths", ak.stock_board_concept_cons_ths, {"symbol": symbol}),
+            ],
+            cache_name=f"{func_name}:{symbol}",
+        )
         _record_stat(func_name, (time.time() - start) * 1000)
         return _df_to_response(df)
     except Exception as e:
         _record_stat(func_name, (time.time() - start) * 1000, is_error=True)
-        logger.error("stock_board_concept_cons_em failed", symbol=symbol, error=str(e))
+        logger.error("概念成份全部数据源失败", symbol=symbol, error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
