@@ -17,6 +17,7 @@ AKShare Gateway — 统一第三方数据接口网关平台 v3.0
 
 import hashlib
 import json
+import math
 import os
 import random
 import ssl
@@ -437,8 +438,34 @@ class _SafeJSONEncoder(json.JSONEncoder):
 
 
 def _safe_serialize(obj):
-    """安全序列化，处理所有特殊类型"""
-    return json.loads(json.dumps(obj, cls=_SafeJSONEncoder, ensure_ascii=False))
+    """安全序列化，处理所有特殊类型，包括 NaN/Inf/date/time"""
+    def _clean(o):
+        """递归清理不可序列化的值"""
+        if isinstance(o, dict):
+            return {k: _clean(v) for k, v in o.items()}
+        elif isinstance(o, (list, tuple)):
+            return [_clean(item) for item in o]
+        elif isinstance(o, float):
+            if math.isnan(o) or math.isinf(o):
+                return None
+            return o
+        elif isinstance(o, (datetime, date_type)):
+            return o.isoformat()
+        elif isinstance(o, time_type):
+            return o.isoformat()
+        elif isinstance(o, pd.Timestamp):
+            return o.isoformat()
+        elif isinstance(o, pd.Timedelta):
+            return str(o)
+        elif hasattr(o, 'item'):  # numpy scalar
+            val = o.item()
+            if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+                return None
+            return val
+        return o
+
+    cleaned = _clean(obj)
+    return json.loads(json.dumps(cleaned, ensure_ascii=False))
 
 
 def _df_to_response(df: Optional[pd.DataFrame], name: str = "data") -> JSONResponse:
