@@ -1045,12 +1045,12 @@ def _fetch_concept_cons_direct_em(symbol: str) -> pd.DataFrame:
 
     for domain in push_domains:
         try:
-            session = requests.Session()
+            import urllib.request
             headers = _build_browser_headers()
             headers['Referer'] = 'https://data.eastmoney.com/bkzj/BK0493.html'
             headers['Connection'] = 'close'
 
-            # 第一步：获取板块代码
+            # 第一步：获取板块代码 (使用 urllib.request 绕过 requests 的 TLS fingerprint)
             list_url = (
                 f"https://{domain}/api/qt/clist/get"
                 f"?pn=1&pz=500&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281"
@@ -1058,8 +1058,10 @@ def _fetch_concept_cons_direct_em(symbol: str) -> pd.DataFrame:
                 f"&fs=m:90+t:3+f:!50"
                 f"&fields=f1,f2,f3,f4,f12,f13,f14"
             )
-            resp = session.get(list_url, headers=headers, timeout=15, verify=True)
-            data = resp.json()
+            req1 = urllib.request.Request(list_url, headers=headers)
+            with urllib.request.urlopen(req1, timeout=15) as response:
+                resp_text = response.read()
+            data = json.loads(resp_text)
 
             board_code = None
             if data and data.get('data') and data['data'].get('diff'):
@@ -1087,10 +1089,10 @@ def _fetch_concept_cons_direct_em(symbol: str) -> pd.DataFrame:
                 f"&fs=b:{board_code}+f:!50"
                 f"&fields=f1,f2,f3,f4,f5,f6,f7,f12,f13,f14,f15,f16,f17,f18,f20,f21,f23,f24,f25,f128,f140,f141,f136"
             )
-            resp2 = session.get(cons_url, headers=headers2, timeout=15, verify=True)
-            session.close()
-
-            data2 = resp2.json()
+            req2 = urllib.request.Request(cons_url, headers=headers2)
+            with urllib.request.urlopen(req2, timeout=15) as response2:
+                resp_text2 = response2.read()
+            data2 = json.loads(resp_text2)
             if data2 and data2.get('data') and data2['data'].get('diff'):
                 rows = []
                 for item in data2['data']['diff']:
@@ -1127,6 +1129,55 @@ def _fetch_concept_cons_direct_em(symbol: str) -> pd.DataFrame:
 
     return pd.DataFrame()
 
+
+def _fetch_fund_flow_rank_sina(indicator: str = "今日") -> pd.DataFrame:
+    """
+    新浪财经个股资金流向排名备用接口
+    仅支持"今日"维度
+    """
+    if indicator != "今日":
+        return pd.DataFrame()
+        
+    headers = _build_browser_headers()
+    headers['Referer'] = 'https://finance.sina.com.cn/'
+    
+    # 尽可能取多页，取前 300 数据
+    all_data = []
+    try:
+        session = requests.Session()
+        for page in range(1, 6):
+            url = (
+                f"http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/MoneyFlow.ssl_bkzj_ssggzj"
+                f"?page={page}&num=60&sort=netamount&asc=0"
+            )
+            r = session.get(url, headers=headers, timeout=10)
+            data = r.json()
+            if not data: break
+            all_data.extend(data)
+            time.sleep(random.uniform(0.2, 0.5))
+            
+        rows = []
+        for item in all_data:
+            if not isinstance(item, dict): continue
+            
+            rows.append({
+                '代码': item.get('symbol', '').replace('sz', '').replace('sh', '').replace('bj', ''),
+                '名称': item.get('name', ''),
+                '最新价': item.get('trade', ''),
+                '涨跌幅': float(item.get('changeratio', 0)) * 100 if item.get('changeratio') else 0,
+                '主力净流入': item.get('netamount', ''),
+                '主力净流入占比': float(item.get('ratioamount', 0)) * 100 if item.get('ratioamount') else 0,
+                '超大单净流入': item.get('r0_net', ''),
+                '大单净流入': item.get('r1_net', ''),
+                '中单净流入': item.get('r2_net', ''),
+            })
+        if rows:
+            df = pd.DataFrame(rows)
+            logger.info("Sina fund flow rank fetched", rows=len(df))
+            return df
+    except Exception as e:
+        logger.warning("Sina fund flow rank failed", error=str(e)[:150])
+    return pd.DataFrame()
 
 # 数据源反爬域名扩展（确保覆盖新浪/腾讯/同花顺）
 _REFERER_POOL.extend([
@@ -1517,6 +1568,21 @@ async def stock_individual_fund_flow_rank(
             return _df_to_response(df)
     except Exception as e:
         logger.warning("直连资金流排名失败", error=str(e)[:150])
+
+    # 数据源3: 新浪财经（终极备用）
+    _record_success()
+    _reset_connections()
+    time.sleep(random.uniform(1.0, 2.0))
+    try:
+        df = _fetch_fund_flow_rank_sina(indicator)
+        if df is not None and not df.empty:
+            cache.set(cache_k, df, _get_ttl(func_name))
+            _record_stat(func_name, (time.time() - start) * 1000)
+            _record_success()
+            logger.info("资金流排名新浪备用成功", rows=len(df))
+            return _df_to_response(df)
+    except Exception as e:
+        logger.warning("新浪资金流排名失败", error=str(e)[:150])
 
     # 所有数据源失败,尝试过期缓存
     with cache._lock:
