@@ -24,7 +24,7 @@ import time
 import traceback
 import threading
 from collections import defaultdict
-from datetime import datetime, date as date_type
+from datetime import datetime, date as date_type, time as time_type
 from typing import Any, Dict, List, Optional
 
 import akshare as ak
@@ -421,9 +421,11 @@ app.add_middleware(
 # =====================================================================
 
 class _SafeJSONEncoder(json.JSONEncoder):
-    """处理 date/datetime/Timestamp 等不可直接序列化的类型"""
+    """处理 date/datetime/time/Timestamp 等不可直接序列化的类型"""
     def default(self, obj):
         if isinstance(obj, (datetime, date_type)):
+            return obj.isoformat()
+        if isinstance(obj, time_type):
             return obj.isoformat()
         if isinstance(obj, pd.Timestamp):
             return obj.isoformat()
@@ -445,7 +447,9 @@ def _df_to_response(df: Optional[pd.DataFrame], name: str = "data") -> JSONRespo
         return JSONResponse(
             content={"status": "ok", "count": 0, "data": []},
         )
-    # 处理 NaN / Inf → null
+    # 处理 NaN / Inf → None
+    import numpy as np
+    df = df.replace([np.inf, -np.inf], None)
     df = df.where(pd.notnull(df), None)
     # 将 Timestamp 列转为字符串
     for col in df.columns:
@@ -1047,13 +1051,24 @@ async def stock_a_indicator_lg(
     func_name = "stock_a_indicator_lg"
     try:
         # 兼容 akshare API 名称变化
-        ak_func = getattr(ak, 'stock_a_indicator_lg', None) or \
-                  getattr(ak, 'stock_a_lg_indicator', None) or \
-                  getattr(ak, 'stock_a_ttm_lyr', None)
+        ak_func = getattr(ak, 'stock_a_indicator_lg', None)
+        ak_kwargs = {"symbol": symbol}
+
+        if ak_func is None:
+            # 尝试其他名称
+            for alt_name, alt_kwargs in [
+                ('stock_a_lg_indicator', {"symbol": symbol}),
+                ('stock_a_ttm_lyr', {"stock": symbol}),
+            ]:
+                ak_func = getattr(ak, alt_name, None)
+                if ak_func is not None:
+                    ak_kwargs = alt_kwargs
+                    break
+
         if ak_func is None:
             raise HTTPException(status_code=501,
                                 detail="当前 akshare 版本不支持估值指标查询")
-        df = _cached_call(func_name, ak_func, symbol=symbol)
+        df = _cached_call(func_name, ak_func, **ak_kwargs)
         _record_stat(func_name, (time.time() - start) * 1000)
         logger.info("stock_a_indicator_lg success", symbol=symbol,
                      count=len(df) if df is not None else 0)
@@ -1229,11 +1244,15 @@ async def stock_board_concept_cons_em(
     start = time.time()
     func_name = "stock_board_concept_cons_em"
     try:
+        # 同花顺概念成份函数名在不同版本有差异
+        ths_cons_func = (getattr(ak, 'stock_board_concept_cons_ths', None) or
+                         getattr(ak, 'stock_board_cons_ths', None))
+        ths_source = [("ths", ths_cons_func, {"symbol": symbol})] if ths_cons_func else []
+
         df = _multi_source_call(
             sources=[
                 ("eastmoney", ak.stock_board_concept_cons_em, {"symbol": symbol}),
-                ("ths", ak.stock_board_concept_cons_ths, {"symbol": symbol}),
-            ],
+            ] + ths_source,
             cache_name=f"{func_name}:{symbol}",
         )
         _record_stat(func_name, (time.time() - start) * 1000)
