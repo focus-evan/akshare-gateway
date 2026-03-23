@@ -1087,31 +1087,48 @@ async def stock_a_indicator_lg(
     try:
         # 依次尝试不同的 API 名称和参数
         candidates = [
-            ('stock_a_indicator_lg', {"symbol": symbol}),
-            ('stock_a_lg_indicator', {"stock": symbol}),   # 可能是 stock_a_ttm_lyr 的别名
-            ('stock_a_ttm_lyr', {"stock": symbol}),
+            ('stock_a_indicator_lg', 'symbol'),
+            ('stock_a_lg_indicator', 'symbol'),
+            ('stock_a_lg_indicator', 'stock'),
+            ('stock_a_ttm_lyr', 'stock'),
+            ('stock_a_ttm_lyr', 'symbol'),
         ]
 
         last_err = None
-        for api_name, api_kwargs in candidates:
+        for api_name, param_name in candidates:
             func = getattr(ak, api_name, None)
             if func is None:
                 continue
             try:
-                df = _cached_call(func_name, func, **api_kwargs)
+                # 先试关键字参数
+                df = _cached_call(func_name, func, **{param_name: symbol})
                 _record_stat(func_name, (time.time() - start) * 1000)
                 logger.info("stock_a_indicator_lg success",
-                            api_used=api_name, symbol=symbol,
+                            api_used=api_name, param=param_name, symbol=symbol,
                             count=len(df) if df is not None else 0)
                 return _df_to_response(df)
             except TypeError as te:
-                # 参数名不对，尝试下一个
-                logger.warning(f"{api_name} parameter error", error=str(te))
+                logger.warning(f"{api_name}({param_name}=) failed", error=str(te))
                 last_err = te
                 continue
             except Exception as e:
                 last_err = e
                 logger.warning(f"{api_name} failed", error=str(e))
+                continue
+
+        # 最后尝试所有函数的位置参数调用
+        for api_name in ['stock_a_indicator_lg', 'stock_a_lg_indicator', 'stock_a_ttm_lyr']:
+            func = getattr(ak, api_name, None)
+            if func is None:
+                continue
+            try:
+                df = _cached_call(func_name, func, symbol)
+                _record_stat(func_name, (time.time() - start) * 1000)
+                logger.info("stock_a_indicator_lg success (positional)",
+                            api_used=api_name, symbol=symbol)
+                return _df_to_response(df)
+            except Exception as e:
+                last_err = e
                 continue
 
         if last_err:

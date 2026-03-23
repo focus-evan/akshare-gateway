@@ -251,16 +251,11 @@ Type=simple
 User=root
 Group=root
 WorkingDirectory=${DEPLOY_DIR}
-ExecStart=${VENV_DIR}/bin/gunicorn app:app \\
-    --bind 0.0.0.0:${PORT} \\
+ExecStart=${VENV_DIR}/bin/python -m uvicorn app:app \\
+    --host 0.0.0.0 \\
+    --port ${PORT} \\
     --workers ${WORKERS} \\
-    --worker-class uvicorn.workers.UvicornWorker \\
-    --timeout ${TIMEOUT} \\
-    --graceful-timeout 30 \\
-    --keep-alive 5 \\
-    --access-logfile ${LOG_DIR}/access.log \\
-    --error-logfile ${LOG_DIR}/error.log \\
-    --capture-output
+    --log-level info
 
 ExecReload=/bin/kill -s HUP \$MAINPID
 ExecStop=/bin/kill -s TERM \$MAINPID
