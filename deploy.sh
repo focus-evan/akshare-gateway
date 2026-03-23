@@ -198,6 +198,16 @@ setup_python_env() {
 
     cd "${DEPLOY_DIR}"
 
+    # 如果虚拟环境已存在但 Python 版本不匹配，删除重建
+    if [ -d "${VENV_DIR}" ]; then
+        VENV_PY_VER=$("${VENV_DIR}/bin/python" --version 2>&1 | awk '{print $2}' || echo "0")
+        SYSTEM_PY_VER=$(${PYTHON_CMD:-python3} --version 2>&1 | awk '{print $2}')
+        if [ "$VENV_PY_VER" != "$SYSTEM_PY_VER" ]; then
+            log_warn "虚拟环境 Python (${VENV_PY_VER}) 与系统 (${SYSTEM_PY_VER}) 不匹配，重建..."
+            rm -rf "${VENV_DIR}"
+        fi
+    fi
+
     if [ ! -d "${VENV_DIR}" ]; then
         log_info "创建虚拟环境..."
         ${PYTHON_CMD:-python3} -m venv "${VENV_DIR}"
@@ -207,13 +217,20 @@ setup_python_env() {
     source "${VENV_DIR}/bin/activate"
 
     log_info "升级 pip..."
-    pip install --upgrade pip -i "${PIP_INDEX}" -q
+    pip install --upgrade pip setuptools wheel \
+        -i "${PIP_INDEX}" \
+        --trusted-host pypi.tuna.tsinghua.edu.cn \
+        -q 2>/dev/null || pip install --upgrade pip -q
 
     log_info "安装依赖..."
-    pip install -r requirements.txt -i "${PIP_INDEX}"
+    pip install -r requirements.txt \
+        -i "${PIP_INDEX}" \
+        --trusted-host pypi.tuna.tsinghua.edu.cn
 
     log_info "Python: $(python --version)"
-    log_info "akshare: $(python -c 'import akshare; print(akshare.__version__)' 2>/dev/null || echo 'installing...')"
+    log_info "akshare: $(python -c 'import akshare; print(akshare.__version__)' 2>/dev/null || echo 'pending...')"
+    log_info "fastapi: $(python -c 'import fastapi; print(fastapi.__version__)' 2>/dev/null || echo 'pending...')"
+    log_info "uvicorn: $(python -c 'import uvicorn; print(uvicorn.__version__)' 2>/dev/null || echo 'pending...')"
     log_info "依赖安装完成 ✅"
 }
 
