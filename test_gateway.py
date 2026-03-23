@@ -205,6 +205,181 @@ def test_direct_akshare(fast: bool = False) -> List[Dict]:
 
 
 # =====================================================================
+#  备用数据源测试（新浪/腾讯/同花顺）
+# =====================================================================
+
+def test_alternative_sources(fast: bool = False) -> List[Dict]:
+    """测试备用数据源的连通性"""
+    _section("备用数据源测试 — 新浪/腾讯/同花顺")
+
+    results = []
+    passed = 0
+    failed = 0
+
+    today_str = datetime.now().strftime("%Y%m%d")
+    start_str = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
+
+    # ---- 新浪财经测试 ----
+    print(f"  {BOLD}--- 新浪财经 ---{RESET}")
+
+    # 新浪 A股实时行情（直接HTTP）
+    try:
+        start = time.time()
+        import requests as _req
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                   "Referer": "https://finance.sina.com.cn/"}
+        url = ("https://vip.stock.finance.sina.com.cn/quotes_service/api/"
+               "json_v2.php/Market_Center.getHQNodeData"
+               "?page=1&num=20&sort=changepercent&asc=0&node=hs_a")
+        resp = _req.get(url, headers=headers, timeout=15)
+        data = resp.json()
+        elapsed = time.time() - start
+        if data and len(data) > 0:
+            _ok(f"新浪A股行情(HTTP直连)  —  {len(data)} 只  ({elapsed:.1f}s)")
+            results.append({"name": "sina_a_spot_http", "status": "PASS", "rows": len(data)})
+            passed += 1
+        else:
+            _fail(f"新浪A股行情(HTTP直连)  —  返回空  ({elapsed:.1f}s)")
+            results.append({"name": "sina_a_spot_http", "status": "FAIL", "error": "empty"})
+            failed += 1
+    except Exception as e:
+        _fail(f"新浪A股行情(HTTP直连)  —  {str(e)[:80]}")
+        results.append({"name": "sina_a_spot_http", "status": "FAIL", "error": str(e)[:80]})
+        failed += 1
+
+    time.sleep(0.5)
+
+    # 新浪实时报价（sinajs）
+    try:
+        start = time.time()
+        url = "https://hq.sinajs.cn/list=sh600519,sz000001"
+        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"}
+        resp = _req.get(url, headers=headers, timeout=10)
+        resp.encoding = 'gbk'
+        elapsed = time.time() - start
+        if '贵州茅台' in resp.text or 'hq_str' in resp.text:
+            _ok(f"新浪实时报价(sinajs)  —  OK  ({elapsed:.1f}s)")
+            results.append({"name": "sina_hq_sinajs", "status": "PASS"})
+            passed += 1
+        else:
+            _fail(f"新浪实时报价(sinajs)  —  异常响应  ({elapsed:.1f}s)")
+            results.append({"name": "sina_hq_sinajs", "status": "FAIL"})
+            failed += 1
+    except Exception as e:
+        _fail(f"新浪实时报价(sinajs)  —  {str(e)[:80]}")
+        results.append({"name": "sina_hq_sinajs", "status": "FAIL", "error": str(e)[:80]})
+        failed += 1
+
+    time.sleep(0.5)
+
+    # 新浪K线（通过akshare）
+    if not fast:
+        try:
+            import akshare as ak
+            start = time.time()
+            func = getattr(ak, 'stock_zh_a_daily', None)
+            if func:
+                df = func(symbol="sh600519", start_date=start_str, end_date=today_str, adjust="qfq")
+                elapsed = time.time() - start
+                rows = len(df) if df is not None else 0
+                if rows > 0:
+                    _ok(f"新浪K线(akshare)  —  {rows} 行  ({elapsed:.1f}s)")
+                    results.append({"name": "sina_kline_ak", "status": "PASS", "rows": rows})
+                    passed += 1
+                else:
+                    _fail(f"新浪K线(akshare)  —  返回空  ({elapsed:.1f}s)")
+                    results.append({"name": "sina_kline_ak", "status": "FAIL"})
+                    failed += 1
+            else:
+                _warn("新浪K线(akshare)  —  stock_zh_a_daily 函数不存在")
+                results.append({"name": "sina_kline_ak", "status": "SKIP"})
+        except Exception as e:
+            _fail(f"新浪K线(akshare)  —  {str(e)[:80]}")
+            results.append({"name": "sina_kline_ak", "status": "FAIL", "error": str(e)[:80]})
+            failed += 1
+        time.sleep(0.5)
+
+    # ---- 腾讯财经测试 ----
+    print(f"\n  {BOLD}--- 腾讯财经 ---{RESET}")
+
+    try:
+        start = time.time()
+        url = (f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+               f"?param=sh600519,day,{start_str},{today_str},30,qfq")
+        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://stockapp.finance.qq.com/"}
+        resp = _req.get(url, headers=headers, timeout=15)
+        data = resp.json()
+        elapsed = time.time() - start
+        klines = data.get('data', {}).get('sh600519', {})
+        day_data = klines.get('qfqday', klines.get('day', []))
+        if day_data and len(day_data) > 0:
+            _ok(f"腾讯K线(HTTP直连)  —  {len(day_data)} 天  ({elapsed:.1f}s)")
+            results.append({"name": "tencent_kline_http", "status": "PASS", "rows": len(day_data)})
+            passed += 1
+        else:
+            _fail(f"腾讯K线(HTTP直连)  —  返回空  ({elapsed:.1f}s)")
+            results.append({"name": "tencent_kline_http", "status": "FAIL"})
+            failed += 1
+    except Exception as e:
+        _fail(f"腾讯K线(HTTP直连)  —  {str(e)[:80]}")
+        results.append({"name": "tencent_kline_http", "status": "FAIL", "error": str(e)[:80]})
+        failed += 1
+
+    time.sleep(0.5)
+
+    # ---- 同花顺测试 ----
+    print(f"\n  {BOLD}--- 同花顺 ---{RESET}")
+
+    try:
+        import akshare as ak
+        start = time.time()
+        df = ak.stock_board_concept_name_ths()
+        elapsed = time.time() - start
+        rows = len(df) if df is not None else 0
+        if rows > 0:
+            _ok(f"同花顺概念板块(akshare)  —  {rows} 板块  ({elapsed:.1f}s)")
+            results.append({"name": "ths_concept_ak", "status": "PASS", "rows": rows})
+            passed += 1
+        else:
+            _fail(f"同花顺概念板块(akshare)  —  返回空  ({elapsed:.1f}s)")
+            results.append({"name": "ths_concept_ak", "status": "FAIL"})
+            failed += 1
+    except Exception as e:
+        _fail(f"同花顺概念板块(akshare)  —  {str(e)[:80]}")
+        results.append({"name": "ths_concept_ak", "status": "FAIL", "error": str(e)[:80]})
+        failed += 1
+
+    time.sleep(0.5)
+
+    # ---- 财联社测试 ----
+    print(f"\n  {BOLD}--- 财联社 ---{RESET}")
+
+    try:
+        import akshare as ak
+        start = time.time()
+        df = ak.stock_info_global_cls()
+        elapsed = time.time() - start
+        rows = len(df) if df is not None else 0
+        if rows > 0:
+            _ok(f"财联社快讯(akshare)  —  {rows} 条  ({elapsed:.1f}s)")
+            results.append({"name": "cls_news_ak", "status": "PASS", "rows": rows})
+            passed += 1
+        else:
+            _fail(f"财联社快讯(akshare)  —  返回空")
+            results.append({"name": "cls_news_ak", "status": "FAIL"})
+            failed += 1
+    except Exception as e:
+        _fail(f"财联社快讯(akshare)  —  {str(e)[:80]}")
+        results.append({"name": "cls_news_ak", "status": "FAIL", "error": str(e)[:80]})
+        failed += 1
+
+    print(f"\n  📊 备用数据源总结：{GREEN}{passed} 通过{RESET} / "
+          f"{RED}{failed} 失败{RESET}")
+
+    return results
+
+
+# =====================================================================
 #  网关测试（调 gateway HTTP 接口）
 # =====================================================================
 
@@ -479,6 +654,13 @@ def main():
     # 直连测试
     if args.mode in ("direct", "all"):
         results = test_direct_akshare(fast=args.fast)
+        all_results.extend(results)
+        total_pass += sum(1 for r in results if r["status"] in ("PASS", "WARN"))
+        total_fail += sum(1 for r in results if r["status"] == "FAIL")
+
+    # 备用数据源测试
+    if args.mode in ("direct", "all"):
+        results = test_alternative_sources(fast=args.fast)
         all_results.extend(results)
         total_pass += sum(1 for r in results if r["status"] in ("PASS", "WARN"))
         total_fail += sum(1 for r in results if r["status"] == "FAIL")
