@@ -32,6 +32,7 @@ import time
 import traceback
 import urllib.request
 import urllib.error
+import urllib.parse
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -212,7 +213,10 @@ def _gateway_get(base_url: str, path: str, params: dict = None,
     """调用 gateway 接口，返回 (JSON body, 耗时秒)"""
     url = f"{base_url.rstrip('/')}{path}"
     if params:
-        query = "&".join(f"{k}={v}" for k, v in params.items())
+        query = "&".join(
+            f"{k}={urllib.parse.quote(str(v), safe='')}"
+            for k, v in params.items()
+        )
         url = f"{url}?{query}"
 
     headers = {"Accept": "application/json", "User-Agent": "test-gateway/1.0"}

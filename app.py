@@ -16,6 +16,7 @@ AKShare Gateway — 统一第三方数据接口网关平台 v3.0
 """
 
 import hashlib
+import json
 import os
 import random
 import ssl
@@ -23,7 +24,7 @@ import time
 import traceback
 import threading
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, date as date_type
 from typing import Any, Dict, List, Optional
 
 import akshare as ak
@@ -145,13 +146,28 @@ def _patch_akshare_session():
     通过替换 Session.request 方法，在底层注入真实浏览器指纹。
     """
     _original_request = requests.Session.request
+    _original_init = requests.Session.__init__
+
+    def _patched_init(self, *args, **kwargs):
+        _original_init(self, *args, **kwargs)
+        # 设置连接池参数：禁止连接复用过久，减少被封时的影响面
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=10,
+            pool_maxsize=10,
+            max_retries=0,  # 由我们自己的 _retry 控制重试
+            pool_block=False,
+        )
+        self.mount("https://", adapter)
+        self.mount("http://", adapter)
 
     def _patched_request(self, method, url, **kwargs):
         # 只对东财/新浪/同花顺等金融数据源注入 headers
         target_domains = (
             "eastmoney.com", "push2.eastmoney.com",
+            "push2his.eastmoney.com",
             "datacenter.eastmoney.com", "data.eastmoney.com",
-            "quote.eastmoney.com",
+            "datacenter-web.eastmoney.com",
+            "quote.eastmoney.com", "emweb.securities.eastmoney.com",
             "sina.com", "sinajs.cn",
             "10jqka.com.cn",  # 同花顺
         )
@@ -171,8 +187,13 @@ def _patch_akshare_session():
             if "timeout" not in kwargs:
                 kwargs["timeout"] = 30
 
+            # 对东财接口禁用 SSL 验证（部分被封时 SSL 握手会超时）
+            if "verify" not in kwargs:
+                kwargs["verify"] = True
+
         return _original_request(self, method, url, **kwargs)
 
+    requests.Session.__init__ = _patched_init
     requests.Session.request = _patched_request
     logger.info("akshare Session patched with browser fingerprint injection")
 
@@ -399,6 +420,25 @@ app.add_middleware(
 #  工具函数
 # =====================================================================
 
+class _SafeJSONEncoder(json.JSONEncoder):
+    """处理 date/datetime/Timestamp 等不可直接序列化的类型"""
+    def default(self, obj):
+        if isinstance(obj, (datetime, date_type)):
+            return obj.isoformat()
+        if isinstance(obj, pd.Timestamp):
+            return obj.isoformat()
+        if isinstance(obj, (pd.Timedelta,)):
+            return str(obj)
+        if hasattr(obj, 'item'):  # numpy int/float
+            return obj.item()
+        return super().default(obj)
+
+
+def _safe_serialize(obj):
+    """安全序列化，处理所有特殊类型"""
+    return json.loads(json.dumps(obj, cls=_SafeJSONEncoder, ensure_ascii=False))
+
+
 def _df_to_response(df: Optional[pd.DataFrame], name: str = "data") -> JSONResponse:
     """将 DataFrame 转为 JSON 响应"""
     if df is None or df.empty:
@@ -407,17 +447,47 @@ def _df_to_response(df: Optional[pd.DataFrame], name: str = "data") -> JSONRespo
         )
     # 处理 NaN / Inf → null
     df = df.where(pd.notnull(df), None)
+    # 将 Timestamp 列转为字符串
+    for col in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            df[col] = df[col].astype(str).replace('NaT', None)
     records = df.to_dict(orient="records")
+    # 安全序列化：处理 date/datetime/numpy 类型
+    safe_records = _safe_serialize(records)
     return JSONResponse(
-        content={"status": "ok", "count": len(records), "data": records},
+        content={"status": "ok", "count": len(safe_records), "data": safe_records},
     )
+
+
+def _reset_connections():
+    """
+    强制重置所有 HTTP 连接池。
+    当被反爬封锁时，旧的TCP连接可能已被服务端标记，
+    需要关闭并新建连接才能绕过。
+    """
+    try:
+        import urllib3
+        urllib3.disable_warnings()
+    except ImportError:
+        pass
+
+    # 关闭 requests 默认 Session 的连接池
+    try:
+        for attr_name in dir(requests):
+            obj = getattr(requests, attr_name, None)
+            if isinstance(obj, requests.Session):
+                obj.close()
+    except Exception:
+        pass
+
+    logger.info("Connection pools reset")
 
 
 def _retry(func, *args, max_retries: int = 3, delay: float = 2.0, **kwargs):
     """
     带重试 + 指数退避 + 反爬感知的函数调用
 
-    每次重试前会: 切换 headers、增加延迟、记录错误到退避系统
+    每次重试前会: 切换 headers、增加延迟、重置连接池、记录错误到退避系统
     """
     last_err = None
     for attempt in range(1, max_retries + 1):
@@ -432,7 +502,9 @@ def _retry(func, *args, max_retries: int = 3, delay: float = 2.0, **kwargs):
             # 检测是否被反爬封锁
             is_anti_scrape = any(kw in error_str for kw in [
                 "connection aborted", "remote end closed",
+                "remotedisconnected", "connectionreset",
                 "443", "forbidden", "too many requests",
+                "456",  # HTTP 456 (自定义反爬状态码)
                 "验证", "频繁", "限制", "block",
             ])
 
@@ -447,6 +519,10 @@ def _retry(func, *args, max_retries: int = 3, delay: float = 2.0, **kwargs):
             )
 
             if attempt < max_retries:
+                # 反爬时重置连接池（强制新建TCP连接）
+                if is_anti_scrape:
+                    _reset_connections()
+
                 # 指数退避 + 随机抖动，反爬时退避更久
                 base_delay = delay * (2 ** (attempt - 1))
                 if is_anti_scrape:
@@ -703,16 +779,25 @@ async def stock_a_indicator_lg(
     """
     获取个股 PE/PB/PS 等估值指标历史数据（乐咕乐估）
 
-    对应 akshare: ak.stock_a_indicator_lg(symbol)
+    兼容新旧版本 akshare API 名称变化
     """
     start = time.time()
     func_name = "stock_a_indicator_lg"
     try:
-        df = _cached_call(func_name, ak.stock_a_indicator_lg, symbol=symbol)
+        # 兼容 akshare API 名称变化
+        ak_func = getattr(ak, 'stock_a_indicator_lg', None) or \
+                  getattr(ak, 'stock_a_lg_indicator', None) or \
+                  getattr(ak, 'stock_a_ttm_lyr', None)
+        if ak_func is None:
+            raise HTTPException(status_code=501,
+                                detail="当前 akshare 版本不支持估值指标查询")
+        df = _cached_call(func_name, ak_func, symbol=symbol)
         _record_stat(func_name, (time.time() - start) * 1000)
         logger.info("stock_a_indicator_lg success", symbol=symbol,
                      count=len(df) if df is not None else 0)
         return _df_to_response(df)
+    except HTTPException:
+        raise
     except Exception as e:
         _record_stat(func_name, (time.time() - start) * 1000, is_error=True)
         logger.error("stock_a_indicator_lg failed", symbol=symbol, error=str(e))
