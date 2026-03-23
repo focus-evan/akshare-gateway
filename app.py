@@ -1,5 +1,5 @@
 """
-AKShare Gateway — 统一第三方数据接口网关平台
+AKShare Gateway — 统一第三方数据接口网关平台 v3.0
 
 部署在独立服务器/Docker 中，供 ai-stock 主服务通过内网调用。
 解决云服务器直接调用 akshare 时被东方财富反爬封锁的问题。
@@ -10,21 +10,25 @@ AKShare Gateway — 统一第三方数据接口网关平台
   3. TTL 缓存 — 减少对东财的请求频率
   4. 请求限流 — 自动随机延迟，防止触发风控
   5. 统计监控 — 请求次数、缓存命中率、接口耗时
+  6. **反爬绕过** — Session伪装、Header轮换、指纹随机化、退避策略
 
 所有接口返回 JSON 格式: {"status":"ok","count":N,"data":[...]}
 """
 
 import hashlib
+import os
 import random
+import ssl
 import time
 import traceback
 import threading
 from collections import defaultdict
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import akshare as ak
 import pandas as pd
+import requests
 import structlog
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,6 +41,144 @@ structlog.configure(
     ]
 )
 logger = structlog.get_logger()
+
+
+# =====================================================================
+#  反爬伪装引擎（核心优化）
+# =====================================================================
+
+# User-Agent 池 — 模拟真实浏览器分布
+_UA_POOL = [
+    # Chrome 125 (Windows 11)
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    # Chrome 124 (Windows 10)
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    # Chrome 125 (macOS)
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    # Firefox 126 (Windows)
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) "
+    "Gecko/20100101 Firefox/126.0",
+    # Edge 124 (Windows)
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+    # Chrome 123 (Linux)
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    # Safari 17 (macOS)
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+    # Chrome 126 (Windows 11) - newer
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+]
+
+# Referer 池 — 模拟从不同页面跳转
+_REFERER_POOL = [
+    "https://quote.eastmoney.com/",
+    "https://data.eastmoney.com/",
+    "https://guba.eastmoney.com/",
+    "https://so.eastmoney.com/",
+    "https://www.eastmoney.com/",
+    "https://fund.eastmoney.com/",
+    "https://choice.eastmoney.com/",
+]
+
+# Accept-Language 池
+_LANG_POOL = [
+    "zh-CN,zh;q=0.9,en;q=0.8",
+    "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+    "zh-CN,zh;q=0.9",
+    "zh-CN,zh-TW;q=0.9,zh;q=0.8,en;q=0.7",
+]
+
+
+def _build_browser_headers() -> Dict[str, str]:
+    """
+    构建高仿真浏览器请求头
+
+    每次请求随机组合 UA + Referer + Accept 等，
+    模拟不同浏览器/不同页面的访问行为。
+    """
+    ua = random.choice(_UA_POOL)
+    is_chrome = "Chrome" in ua and "Edg" not in ua
+
+    headers = {
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                  "image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": random.choice(_LANG_POOL),
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Referer": random.choice(_REFERER_POOL),
+        "Cache-Control": random.choice(["no-cache", "max-age=0"]),
+        "Upgrade-Insecure-Requests": "1",
+    }
+
+    # Chrome 特有的 sec- 系列头（东财检测的重点）
+    if is_chrome:
+        headers.update({
+            "sec-ch-ua": random.choice([
+                '"Chromium";v="125", "Google Chrome";v="125", "Not.A/Brand";v="24"',
+                '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+                '"Chromium";v="126", "Google Chrome";v="126", "Not/A)Brand";v="8"',
+            ]),
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": random.choice(['"Windows"', '"macOS"', '"Linux"']),
+            "Sec-Fetch-Dest": random.choice(["document", "empty"]),
+            "Sec-Fetch-Mode": random.choice(["navigate", "cors", "no-cors"]),
+            "Sec-Fetch-Site": random.choice(["same-origin", "same-site", "none"]),
+        })
+
+    return headers
+
+
+def _patch_akshare_session():
+    """
+    Monkey-patch akshare 底层的 requests.Session，
+    让每次请求自动携带随机浏览器 headers。
+
+    akshare 内部使用 requests.get / requests.Session 访问东财/新浪等，
+    默认的 User-Agent 是 python-requests/x.x.x，极易被识别为爬虫。
+    通过替换 Session.request 方法，在底层注入真实浏览器指纹。
+    """
+    _original_request = requests.Session.request
+
+    def _patched_request(self, method, url, **kwargs):
+        # 只对东财/新浪/同花顺等金融数据源注入 headers
+        target_domains = (
+            "eastmoney.com", "push2.eastmoney.com",
+            "datacenter.eastmoney.com", "data.eastmoney.com",
+            "quote.eastmoney.com",
+            "sina.com", "sinajs.cn",
+            "10jqka.com.cn",  # 同花顺
+        )
+
+        is_target = any(d in str(url) for d in target_domains)
+
+        if is_target:
+            # 注入浏览器 headers（不覆盖已有的）
+            browser_headers = _build_browser_headers()
+            if "headers" not in kwargs or kwargs["headers"] is None:
+                kwargs["headers"] = {}
+            for key, value in browser_headers.items():
+                if key not in kwargs["headers"]:
+                    kwargs["headers"][key] = value
+
+            # 确保 timeout 合理
+            if "timeout" not in kwargs:
+                kwargs["timeout"] = 30
+
+        return _original_request(self, method, url, **kwargs)
+
+    requests.Session.request = _patched_request
+    logger.info("akshare Session patched with browser fingerprint injection")
+
+
+# 启动时就 patch
+_patch_akshare_session()
 
 
 # =====================================================================
@@ -71,6 +213,15 @@ class TTLCache:
     def clear(self):
         with self._lock:
             self._store.clear()
+
+    def cleanup(self):
+        """清理过期缓存"""
+        with self._lock:
+            now = time.time()
+            expired = [k for k, (_, t) in self._store.items() if now >= t]
+            for k in expired:
+                del self._store[k]
+            return len(expired)
 
     @property
     def stats(self) -> dict:
@@ -125,10 +276,8 @@ def _cache_key(func_name: str, **kwargs) -> str:
 
 def _get_ttl(func_name: str) -> float:
     """获取函数的缓存 TTL"""
-    # 精确匹配
     if func_name in CACHE_TTL:
         return CACHE_TTL[func_name]
-    # 去掉 stock_ 前缀匹配
     short = func_name.replace("stock_", "")
     if short in CACHE_TTL:
         return CACHE_TTL[short]
@@ -136,26 +285,77 @@ def _get_ttl(func_name: str) -> float:
 
 
 # =====================================================================
-#  请求限流 & 统计
+#  智能限流 & 退避策略
 # =====================================================================
 
 _last_request_time = 0.0
 _rate_lock = threading.Lock()
+_consecutive_errors = 0
+_error_lock = threading.Lock()
 
-# 最小请求间隔（秒）— 防止频率过高触发东财风控
-MIN_REQUEST_INTERVAL = 0.3
+# 基础请求间隔（秒）
+MIN_REQUEST_INTERVAL = 0.5  # 从 0.3 提升到 0.5，减少触发频率
+
+# 退避策略参数
+MAX_BACKOFF_INTERVAL = 30.0  # 最大退避到 30 秒
+BACKOFF_DECAY_TIME = 300     # 5 分钟无错误后重置退避
 
 
-def _rate_limit():
-    """请求间自动随机延迟"""
+def _smart_rate_limit():
+    """
+    智能限流：正常时温和延迟，遇到反爬时指数退避
+
+    - 正常：0.5~1.5s 随机间隔
+    - 连续出错 1 次：2~4s
+    - 连续出错 2 次：4~8s
+    - 连续出错 3+ 次：8~30s
+    """
     global _last_request_time
     with _rate_lock:
         now = time.time()
+
+        # 基于连续错误数计算退避间隔
+        with _error_lock:
+            err_count = _consecutive_errors
+
+        if err_count == 0:
+            interval = MIN_REQUEST_INTERVAL + random.uniform(0.0, 1.0)
+        elif err_count == 1:
+            interval = 2.0 + random.uniform(0.0, 2.0)
+        elif err_count == 2:
+            interval = 4.0 + random.uniform(0.0, 4.0)
+        else:
+            interval = min(MAX_BACKOFF_INTERVAL,
+                           8.0 * (1.5 ** (err_count - 3)) + random.uniform(0.0, 5.0))
+
         elapsed = now - _last_request_time
-        if elapsed < MIN_REQUEST_INTERVAL:
-            delay = MIN_REQUEST_INTERVAL - elapsed + random.uniform(0.1, 0.5)
+        if elapsed < interval:
+            delay = interval - elapsed
+            logger.debug("Smart rate limit", delay=round(delay, 1),
+                         error_level=err_count)
             time.sleep(delay)
+
         _last_request_time = time.time()
+
+
+def _record_success():
+    """记录成功请求，重置退避"""
+    global _consecutive_errors
+    with _error_lock:
+        if _consecutive_errors > 0:
+            logger.info("Anti-scrape backoff reset",
+                        previous_errors=_consecutive_errors)
+        _consecutive_errors = 0
+
+
+def _record_error():
+    """记录失败请求，增加退避"""
+    global _consecutive_errors
+    with _error_lock:
+        _consecutive_errors += 1
+        logger.warning("Anti-scrape backoff increased",
+                       consecutive_errors=_consecutive_errors,
+                       next_interval=f"{min(MAX_BACKOFF_INTERVAL, 2 ** _consecutive_errors):.0f}s")
 
 
 # 请求统计
@@ -183,8 +383,8 @@ def _record_stat(func_name: str, elapsed_ms: float, is_error: bool = False, cach
 
 app = FastAPI(
     title="AKShare Gateway",
-    description="统一第三方数据接口网关 — 为 ai-stock 提供数据代理，支持缓存、限流、监控",
-    version="2.0.0",
+    description="统一第三方数据接口网关 v3.0 — 缓存 + 限流 + 反爬绕过 + 监控",
+    version="3.0.0",
 )
 
 app.add_middleware(
@@ -214,31 +414,59 @@ def _df_to_response(df: Optional[pd.DataFrame], name: str = "data") -> JSONRespo
 
 
 def _retry(func, *args, max_retries: int = 3, delay: float = 2.0, **kwargs):
-    """带重试的函数调用"""
+    """
+    带重试 + 指数退避 + 反爬感知的函数调用
+
+    每次重试前会: 切换 headers、增加延迟、记录错误到退避系统
+    """
     last_err = None
     for attempt in range(1, max_retries + 1):
         try:
             result = func(*args, **kwargs)
+            _record_success()
             return result
         except Exception as e:
             last_err = e
+            error_str = str(e).lower()
+
+            # 检测是否被反爬封锁
+            is_anti_scrape = any(kw in error_str for kw in [
+                "connection aborted", "remote end closed",
+                "443", "forbidden", "too many requests",
+                "验证", "频繁", "限制", "block",
+            ])
+
+            _record_error()
+
             logger.warning(
                 "akshare call failed, retrying",
                 func=func.__name__,
                 attempt=attempt,
+                is_anti_scrape=is_anti_scrape,
                 error=str(e),
             )
+
             if attempt < max_retries:
-                time.sleep(delay * attempt)
+                # 指数退避 + 随机抖动，反爬时退避更久
+                base_delay = delay * (2 ** (attempt - 1))
+                if is_anti_scrape:
+                    base_delay *= 2  # 反爬封锁时加倍退避
+                jitter = random.uniform(0, base_delay * 0.5)
+                actual_delay = base_delay + jitter
+                logger.info("Retry backoff", delay=round(actual_delay, 1),
+                            attempt=attempt)
+                time.sleep(actual_delay)
+
     raise last_err
 
 
 def _cached_call(func_name: str, func, *args, **kwargs) -> pd.DataFrame:
     """
-    带缓存的 akshare 调用
+    带缓存 + 智能限流的 akshare 调用
 
     1. 检查缓存
-    2. 未命中则限流 + 调用 + 缓存结果
+    2. 未命中则智能限流 + 调用 + 缓存结果
+    3. 失败时尝试返回过期缓存（degraded mode）
     """
     key = _cache_key(func_name, **kwargs)
     cached = cache.get(key)
@@ -246,19 +474,57 @@ def _cached_call(func_name: str, func, *args, **kwargs) -> pd.DataFrame:
         logger.debug("Cache hit", func=func_name, key=key)
         return cached
 
-    # 限流
-    _rate_limit()
+    # 智能限流（根据错误频率动态调整间隔）
+    _smart_rate_limit()
 
-    # 调用
-    df = _retry(func, *args, **kwargs)
+    try:
+        # 调用
+        df = _retry(func, *args, **kwargs)
 
-    # 缓存
-    ttl = _get_ttl(func_name)
-    if df is not None and not df.empty:
-        cache.set(key, df, ttl)
-        logger.debug("Cached result", func=func_name, key=key, ttl=ttl, rows=len(df))
+        # 缓存
+        ttl = _get_ttl(func_name)
+        if df is not None and not df.empty:
+            cache.set(key, df, ttl)
+            logger.debug("Cached result", func=func_name, key=key,
+                         ttl=ttl, rows=len(df))
 
-    return df
+        return df
+
+    except Exception as e:
+        # 降级：尝试返回过期缓存（宁可用旧数据也不返回空）
+        logger.warning("Call failed, checking stale cache", func=func_name,
+                        error=str(e))
+        # 直接检查 store 绕过 TTL
+        with cache._lock:
+            if key in cache._store:
+                stale_data, _ = cache._store[key]
+                logger.warning("Returning STALE cached data (degraded mode)",
+                               func=func_name, key=key)
+                return stale_data
+
+        raise
+
+
+# =====================================================================
+#  定时缓存清理
+# =====================================================================
+
+def _start_cache_cleanup():
+    """后台线程定期清理过期缓存"""
+    def _cleanup_loop():
+        while True:
+            time.sleep(300)  # 每 5 分钟清理一次
+            try:
+                removed = cache.cleanup()
+                if removed > 0:
+                    logger.debug("Cache cleanup", removed=removed)
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_cleanup_loop, daemon=True)
+    t.start()
+
+_start_cache_cleanup()
 
 
 # =====================================================================
@@ -268,12 +534,19 @@ def _cached_call(func_name: str, func, *args, **kwargs) -> pd.DataFrame:
 @app.get("/health")
 async def health():
     """健康检查"""
+    with _error_lock:
+        err_count = _consecutive_errors
     return {
         "status": "ok",
         "service": "akshare-gateway",
-        "version": "2.0.0",
+        "version": "3.0.0",
         "time": datetime.now().isoformat(),
         "cache": cache.stats,
+        "anti_scrape": {
+            "consecutive_errors": err_count,
+            "backoff_level": "normal" if err_count == 0 else
+                             "mild" if err_count <= 2 else "aggressive",
+        },
     }
 
 
@@ -292,10 +565,17 @@ async def stats():
                 "error_rate": f"{s['errors'] / s['count'] * 100:.1f}%" if s["count"] > 0 else "0%",
             }
 
+    with _error_lock:
+        err_count = _consecutive_errors
+
     return {
         "status": "ok",
         "uptime": datetime.now().isoformat(),
         "cache": cache.stats,
+        "anti_scrape": {
+            "consecutive_errors": err_count,
+            "session_patched": True,
+        },
         "endpoints": endpoints,
     }
 
@@ -306,6 +586,17 @@ async def clear_cache():
     cache.clear()
     logger.info("Cache cleared manually")
     return {"status": "ok", "message": "Cache cleared"}
+
+
+@app.post("/anti-scrape/reset")
+async def reset_anti_scrape():
+    """手动重置反爬退避状态"""
+    global _consecutive_errors
+    with _error_lock:
+        old = _consecutive_errors
+        _consecutive_errors = 0
+    logger.info("Anti-scrape backoff manually reset", previous_errors=old)
+    return {"status": "ok", "previous_errors": old, "current_errors": 0}
 
 
 # =====================================================================
@@ -329,7 +620,7 @@ async def stock_zh_a_spot_em():
             return _df_to_response(cached)
 
         logger.info("Fetching stock_zh_a_spot_em")
-        _rate_limit()
+        _smart_rate_limit()
         df = _retry(ak.stock_zh_a_spot_em)
         if df is not None and not df.empty:
             cache.set(key, df, _get_ttl(func_name))
