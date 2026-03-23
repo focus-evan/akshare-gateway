@@ -34,7 +34,7 @@ import requests
 import structlog
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 
 structlog.configure(
     processors=[
@@ -468,26 +468,34 @@ def _safe_serialize(obj):
     return json.loads(json.dumps(cleaned, ensure_ascii=False))
 
 
-def _df_to_response(df: Optional[pd.DataFrame], name: str = "data") -> JSONResponse:
-    """将 DataFrame 转为 JSON 响应"""
+def _df_to_response(df: Optional[pd.DataFrame], name: str = "data") -> Response:
+    """将 DataFrame 转为 JSON 响应（使用 Response 绕过 JSONResponse 的 allow_nan=False）"""
     if df is None or df.empty:
-        return JSONResponse(
-            content={"status": "ok", "count": 0, "data": []},
-        )
+        body = json.dumps({"status": "ok", "count": 0, "data": []}, ensure_ascii=False)
+        return Response(content=body, media_type="application/json")
+
     # 处理 NaN / Inf → None
     import numpy as np
     df = df.replace([np.inf, -np.inf], None)
     df = df.where(pd.notnull(df), None)
+
     # 将 Timestamp 列转为字符串
     for col in df.columns:
         if pd.api.types.is_datetime64_any_dtype(df[col]):
             df[col] = df[col].astype(str).replace('NaT', None)
+
     records = df.to_dict(orient="records")
-    # 安全序列化：处理 date/datetime/numpy 类型
+
+    # 递归清理所有不可序列化的值（NaN/Inf/date/time/numpy）
     safe_records = _safe_serialize(records)
-    return JSONResponse(
-        content={"status": "ok", "count": len(safe_records), "data": safe_records},
+
+    # 手动 json.dumps + default=str 兼容万一显漏的类型
+    body = json.dumps(
+        {"status": "ok", "count": len(safe_records), "data": safe_records},
+        ensure_ascii=False,
+        default=str,  # 最终兆底：任何无法序列化的类型都转为字符串
     )
+    return Response(content=body, media_type="application/json")
 
 
 def _reset_connections():
@@ -1077,29 +1085,39 @@ async def stock_a_indicator_lg(
     start = time.time()
     func_name = "stock_a_indicator_lg"
     try:
-        # 兼容 akshare API 名称变化
-        ak_func = getattr(ak, 'stock_a_indicator_lg', None)
-        ak_kwargs = {"symbol": symbol}
+        # 依次尝试不同的 API 名称和参数
+        candidates = [
+            ('stock_a_indicator_lg', {"symbol": symbol}),
+            ('stock_a_lg_indicator', {"stock": symbol}),   # 可能是 stock_a_ttm_lyr 的别名
+            ('stock_a_ttm_lyr', {"stock": symbol}),
+        ]
 
-        if ak_func is None:
-            # 尝试其他名称
-            for alt_name, alt_kwargs in [
-                ('stock_a_lg_indicator', {"symbol": symbol}),
-                ('stock_a_ttm_lyr', {"stock": symbol}),
-            ]:
-                ak_func = getattr(ak, alt_name, None)
-                if ak_func is not None:
-                    ak_kwargs = alt_kwargs
-                    break
+        last_err = None
+        for api_name, api_kwargs in candidates:
+            func = getattr(ak, api_name, None)
+            if func is None:
+                continue
+            try:
+                df = _cached_call(func_name, func, **api_kwargs)
+                _record_stat(func_name, (time.time() - start) * 1000)
+                logger.info("stock_a_indicator_lg success",
+                            api_used=api_name, symbol=symbol,
+                            count=len(df) if df is not None else 0)
+                return _df_to_response(df)
+            except TypeError as te:
+                # 参数名不对，尝试下一个
+                logger.warning(f"{api_name} parameter error", error=str(te))
+                last_err = te
+                continue
+            except Exception as e:
+                last_err = e
+                logger.warning(f"{api_name} failed", error=str(e))
+                continue
 
-        if ak_func is None:
-            raise HTTPException(status_code=501,
-                                detail="当前 akshare 版本不支持估值指标查询")
-        df = _cached_call(func_name, ak_func, **ak_kwargs)
-        _record_stat(func_name, (time.time() - start) * 1000)
-        logger.info("stock_a_indicator_lg success", symbol=symbol,
-                     count=len(df) if df is not None else 0)
-        return _df_to_response(df)
+        if last_err:
+            raise last_err
+        raise HTTPException(status_code=501,
+                            detail="当前 akshare 版本不支持估值指标查询")
     except HTTPException:
         raise
     except Exception as e:
@@ -1271,19 +1289,29 @@ async def stock_board_concept_cons_em(
     start = time.time()
     func_name = "stock_board_concept_cons_em"
     try:
-        # 同花顺概念成份函数名在不同版本有差异
-        ths_cons_func = (getattr(ak, 'stock_board_concept_cons_ths', None) or
-                         getattr(ak, 'stock_board_cons_ths', None))
-        ths_source = [("ths", ths_cons_func, {"symbol": symbol})] if ths_cons_func else []
+        # 东财优先，失败则走通用代理
+        try:
+            _smart_rate_limit()
+            df = _retry(ak.stock_board_concept_cons_em, max_retries=2, delay=2.0, symbol=symbol)
+            if df is not None and not df.empty:
+                _record_stat(func_name, (time.time() - start) * 1000)
+                return _df_to_response(df)
+        except Exception as em_err:
+            logger.warning("东财概念成份失败", symbol=symbol, error=str(em_err))
 
-        df = _multi_source_call(
-            sources=[
-                ("eastmoney", ak.stock_board_concept_cons_em, {"symbol": symbol}),
-            ] + ths_source,
-            cache_name=f"{func_name}:{symbol}",
-        )
-        _record_stat(func_name, (time.time() - start) * 1000)
-        return _df_to_response(df)
+        # 尝试同花顺备用（动态查找函数名）
+        for ths_name in ['stock_board_concept_cons_ths', 'stock_board_cons_ths']:
+            ths_func = getattr(ak, ths_name, None)
+            if ths_func is not None:
+                try:
+                    df = _retry(ths_func, max_retries=2, delay=1.5, symbol=symbol)
+                    if df is not None and not df.empty:
+                        _record_stat(func_name, (time.time() - start) * 1000)
+                        return _df_to_response(df)
+                except Exception as ths_err:
+                    logger.warning(f"{ths_name} failed", error=str(ths_err))
+
+        raise Exception(f"概念成份股所有数据源失败: {symbol}")
     except Exception as e:
         _record_stat(func_name, (time.time() - start) * 1000, is_error=True)
         logger.error("概念成份全部数据源失败", symbol=symbol, error=str(e))
