@@ -1726,21 +1726,32 @@ async def stock_board_concept_cons_em(
         try:
             # 内联简单实现一个 THS 网页抓取，绕过 akshare 缺失的同花顺概念函数以及东财封锁
             def _fetch_ths_web():
-                import urllib.request
-                ths_codes = {"人工智能": "301558", "低空经济": "309062", "机器人概念": "301432"}
-                code = ths_codes.get(symbol)
-                if not code: return pd.DataFrame()
-                req = urllib.request.Request(
-                    f"http://q.10jqka.com.cn/gn/detail/code/{code}/",
-                    headers=_build_browser_headers()
-                )
-                with urllib.request.urlopen(req, timeout=10) as response:
-                    html = response.read().decode('gbk', errors='ignore')
-                    dfs = pd.read_html(html)
+                try:
+                    import io
+                    ths_codes = {"人工智能": "301558", "低空经济": "309062", "机器人概念": "301432"}
+                    code = ths_codes.get(symbol)
+                    if not code: return pd.DataFrame()
+                    
+                    session = requests.Session()
+                    headers = _build_browser_headers()
+                    # 防止 THS 的防爬盾阻挡
+                    headers['Referer'] = 'http://q.10jqka.com.cn/gn/'
+                    url = f"http://q.10jqka.com.cn/gn/detail/code/{code}/"
+                    
+                    r = session.get(url, headers=headers, timeout=10)
+                    r.encoding = 'gbk'
+                    dfs = pd.read_html(io.StringIO(r.text))
+                    
                     if dfs:
-                        df = dfs[0].rename(columns={'名称': '名称', '最新': '最新价'})
-                        df['代码'] = df['代码'].astype(str).str.zfill(6)
+                        df = dfs[0]
+                        # THS表格第一列是序号, 第二列代码, 第三列名称, 第四列最新(价)
+                        if '名称' in df.columns and '最新' in df.columns:
+                            df = df.rename(columns={'名称': '名称', '最新': '最新价'})
+                        if '代码' in df.columns:
+                            df['代码'] = df['代码'].astype(str).str.zfill(6)
                         return df
+                except Exception as inner_e:
+                    logger.warning("THS inner web fetch failed", error=str(inner_e)[:150])
                 return pd.DataFrame()
             
             df = _fetch_ths_web()
