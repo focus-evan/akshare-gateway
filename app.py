@@ -1289,6 +1289,287 @@ async def stock_zh_a_spot_em():
 
 
 # =====================================================================
+#  A 股全量实时行情（含量比/换手率/流通市值 — 隔夜施工法等策略依赖）
+# =====================================================================
+
+def _fetch_full_a_spot_direct_em() -> pd.DataFrame:
+    """
+    直连东财 push2 clist API 获取全量 A 股行情（5000+ 只）
+
+    包含量比(f10)、换手率(f8)、流通市值(f21)、总市值(f20) 等完整字段。
+    使用多域名轮试 + 浏览器 headers 绕过反爬。
+    """
+    push_domains = [
+        "push2.eastmoney.com",
+        "push2ex.eastmoney.com",
+        "80.push2.eastmoney.com",
+    ]
+
+    for domain in push_domains:
+        try:
+            headers = _build_browser_headers()
+            headers['Referer'] = 'https://quote.eastmoney.com/center/gridlist.html'
+            headers['Connection'] = 'close'
+
+            # f2=最新价 f3=涨跌幅 f4=涨跌额 f5=成交量 f6=成交额 f7=振幅
+            # f8=换手率 f9=市盈率 f10=量比 f12=代码 f14=名称
+            # f15=最高 f16=最低 f17=今开 f18=昨收
+            # f20=总市值 f21=流通市值 f23=市净率
+            url = (
+                f"https://{domain}/api/qt/clist/get"
+                f"?pn=1&pz=6000&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281"
+                f"&fltt=2&invt=2&fid=f3"
+                f"&fs=m:0+t:6+f:!2,m:0+t:13+f:!2,m:0+t:80+f:!2,m:1+t:2+f:!2,m:1+t:23+f:!2"
+                f"&fields=f2,f3,f4,f5,f6,f7,f8,f9,f10,f12,f14,f15,f16,f17,f18,f20,f21,f23"
+            )
+
+            import urllib.request
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=20) as response:
+                resp_text = response.read()
+            data = json.loads(resp_text)
+
+            if data and data.get('data') and data['data'].get('diff'):
+                items = data['data']['diff']
+                rows = []
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    price = item.get('f2')
+                    if price is None or price == '-':
+                        continue
+                    rows.append({
+                        '代码': str(item.get('f12', '')),
+                        '名称': item.get('f14', ''),
+                        '最新价': item.get('f2'),
+                        '涨跌幅': item.get('f3'),
+                        '涨跌额': item.get('f4'),
+                        '成交量': item.get('f5'),
+                        '成交额': item.get('f6'),
+                        '振幅': item.get('f7'),
+                        '换手率': item.get('f8'),
+                        '市盈率-动态': item.get('f9'),
+                        '量比': item.get('f10'),
+                        '最高': item.get('f15'),
+                        '最低': item.get('f16'),
+                        '今开': item.get('f17'),
+                        '昨收': item.get('f18'),
+                        '总市值': item.get('f20'),
+                        '流通市值': item.get('f21'),
+                        '市净率': item.get('f23'),
+                    })
+                if rows:
+                    df = pd.DataFrame(rows)
+                    # 数值转换
+                    for col in ['最新价', '涨跌幅', '涨跌额', '成交量', '成交额',
+                                '振幅', '换手率', '量比', '最高', '最低', '今开',
+                                '昨收', '总市值', '流通市值', '市盈率-动态', '市净率']:
+                        if col in df.columns:
+                            df[col] = pd.to_numeric(df[col], errors='coerce')
+                    logger.info("Direct push2 full A-spot fetched",
+                                domain=domain, rows=len(df))
+                    return df
+
+        except Exception as e:
+            logger.warning("Direct push2 full A-spot failed",
+                           domain=domain, error=str(e)[:150])
+            time.sleep(random.uniform(0.5, 1.5))
+            continue
+
+    return pd.DataFrame()
+
+
+def _fetch_full_a_spot_tencent() -> pd.DataFrame:
+    """
+    腾讯财经批量获取全量 A 股行情（含换手率/流通市值/总市值，无量比）
+    """
+    # 获取代码列表
+    try:
+        code_func = getattr(ak, 'stock_info_a_code_name', None)
+        codes = []
+        if code_func:
+            code_df = code_func()
+            if code_df is not None and not code_df.empty:
+                code_col = None
+                for c in code_df.columns:
+                    if 'code' in str(c).lower() or '代码' in str(c):
+                        code_col = c
+                        break
+                if code_col:
+                    codes = code_df[code_col].astype(str).str.zfill(6).tolist()
+                    codes = [c for c in codes if len(c) == 6 and c[0] in ('0', '3', '6')]
+    except Exception:
+        codes = []
+
+    if not codes:
+        # 兜底生成
+        codes = []
+        codes.extend(str(i) for i in range(600000, 602000))
+        codes.extend(str(i) for i in range(603000, 604000))
+        codes.extend(str(i) for i in range(605000, 605600))
+        codes.extend(str(i).zfill(6) for i in range(1, 1100))
+        codes.extend(str(i).zfill(6) for i in range(2001, 3000))
+        codes.extend(str(i) for i in range(300001, 302000))
+
+    # 转腾讯格式
+    symbols = []
+    for c in codes:
+        c = str(c).zfill(6)
+        if c.startswith(('6', '9')):
+            symbols.append(f"sh{c}")
+        else:
+            symbols.append(f"sz{c}")
+
+    all_records = []
+    batch_size = 800
+
+    for i in range(0, len(symbols), batch_size):
+        batch = symbols[i:i + batch_size]
+        codes_str = ",".join(batch)
+        url = f"http://qt.gtimg.cn/q={codes_str}"
+
+        try:
+            headers = _build_browser_headers()
+            headers['Referer'] = 'https://finance.qq.com/'
+            req = requests.get(url, headers=headers, timeout=15)
+            req.encoding = 'gbk'
+            raw = req.text
+
+            for line in raw.strip().split('\n'):
+                line = line.strip().rstrip(';')
+                if '="' not in line:
+                    continue
+                try:
+                    data_part = line.split('="', 1)[1].strip('"')
+                    if not data_part:
+                        continue
+                    fields = data_part.split('~')
+                    if len(fields) < 47:
+                        continue
+                    price = float(fields[3] or 0)
+                    if price <= 0:
+                        continue
+                    code = fields[2]
+                    if not code or code[0] not in ('0', '3', '6'):
+                        continue
+                    all_records.append({
+                        '代码': code,
+                        '名称': fields[1],
+                        '最新价': price,
+                        '昨收': float(fields[4] or 0),
+                        '今开': float(fields[5] or 0),
+                        '成交量': int(float(fields[6] or 0)) * 100,
+                        '涨跌额': float(fields[31] or 0),
+                        '涨跌幅': float(fields[32] or 0),
+                        '最高': float(fields[33] or 0),
+                        '最低': float(fields[34] or 0),
+                        '成交额': float(fields[37] or 0) * 10000,
+                        '换手率': float(fields[38] or 0),
+                        '振幅': float(fields[43] or 0) if len(fields) > 43 and fields[43] else 0,
+                        '流通市值': float(fields[44] or 0) * 1e8 if len(fields) > 44 and fields[44] else 0,
+                        '总市值': float(fields[45] or 0) * 1e8 if len(fields) > 45 and fields[45] else 0,
+                        '市净率': float(fields[46] or 0) if len(fields) > 46 and fields[46] else 0,
+                    })
+                except (IndexError, ValueError, TypeError):
+                    continue
+        except Exception as e:
+            logger.warning("Tencent batch fetch failed",
+                           batch=f"{i}-{i + len(batch)}", error=str(e)[:150])
+            continue
+
+        if i + batch_size < len(symbols):
+            time.sleep(0.15 + random.random() * 0.2)
+
+    if not all_records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_records)
+    logger.info("Tencent full A-spot fetched", rows=len(df))
+    return df
+
+
+@app.get("/api/stock/zh_a_spot_full")
+async def stock_zh_a_spot_full():
+    """
+    获取 A 股全量实时行情（含量比/换手率/流通市值）
+
+    隔夜施工法等策略依赖量比、换手率、流通市值字段。
+    数据源优先级：
+      1. 直连东财 push2 API（含量比字段 f10）
+      2. akshare stock_zh_a_spot_em（东财完整数据）
+      3. 腾讯财经（全量数据，无量比）
+    """
+    start = time.time()
+    func_name = "stock_zh_a_spot_full"
+
+    # 检查缓存
+    cache_k = _cache_key(func_name)
+    cached = cache.get(cache_k)
+    if cached is not None:
+        _record_stat(func_name, (time.time() - start) * 1000, cache_hit=True)
+        return _df_to_response(cached)
+
+    # 数据源1: 直连东财 push2 API（最优，包含量比）
+    try:
+        _smart_rate_limit()
+        df = _fetch_full_a_spot_direct_em()
+        if df is not None and not df.empty and len(df) > 1000:
+            cache.set(cache_k, df, 60)
+            _record_stat(func_name, (time.time() - start) * 1000)
+            _record_success()
+            logger.info("Full A-spot via direct push2", rows=len(df))
+            return _df_to_response(df)
+    except Exception as e:
+        logger.warning("Direct push2 full A-spot failed", error=str(e)[:150])
+
+    # 重置反爬状态
+    _record_success()
+    _reset_connections()
+    time.sleep(random.uniform(1.0, 2.0))
+
+    # 数据源2: akshare stock_zh_a_spot_em（东财通过 akshare）
+    try:
+        _smart_rate_limit()
+        df = _retry(ak.stock_zh_a_spot_em, max_retries=2, delay=1.5)
+        if df is not None and not df.empty and len(df) > 1000:
+            cache.set(cache_k, df, 60)
+            _record_stat(func_name, (time.time() - start) * 1000)
+            _record_success()
+            logger.info("Full A-spot via akshare", rows=len(df))
+            return _df_to_response(df)
+    except Exception as e:
+        logger.warning("akshare stock_zh_a_spot_em failed", error=str(e)[:150])
+
+    # 重置反爬状态
+    _record_success()
+    _reset_connections()
+    time.sleep(random.uniform(1.0, 2.0))
+
+    # 数据源3: 腾讯财经（全量数据，无量比字段）
+    try:
+        df = _fetch_full_a_spot_tencent()
+        if df is not None and not df.empty and len(df) > 1000:
+            cache.set(cache_k, df, 60)
+            _record_stat(func_name, (time.time() - start) * 1000)
+            _record_success()
+            logger.info("Full A-spot via Tencent", rows=len(df))
+            return _df_to_response(df)
+    except Exception as e:
+        logger.warning("Tencent full A-spot failed", error=str(e)[:150])
+
+    # 所有数据源失败，尝试过期缓存
+    with cache._lock:
+        if cache_k in cache._store:
+            stale_data, _ = cache._store[cache_k]
+            logger.warning("Full A-spot returning stale cache")
+            _record_stat(func_name, (time.time() - start) * 1000)
+            return _df_to_response(stale_data)
+
+    _record_stat(func_name, (time.time() - start) * 1000, is_error=True)
+    raise HTTPException(status_code=500, detail="全量A股行情所有数据源失败")
+
+
+# =====================================================================
 #  港股实时行情
 # =====================================================================
 
