@@ -2241,6 +2241,33 @@ async def generic_akshare_proxy(func_name: str, request: Request):
             adjust=params.get("adjust", "")
         )
 
+    # ★ 通用代理 → 专用端点路由表（带多源降级保护）
+    _REDIRECT_MAP = {
+        "stock_individual_fund_flow_rank": lambda p: stock_individual_fund_flow_rank(
+            indicator=p.get("indicator", "今日")),
+        "stock_zh_a_spot_em": lambda p: stock_zh_a_spot_em(),
+        "stock_hk_spot_em": lambda p: stock_hk_spot_em(),
+        "stock_a_indicator_lg": lambda p: stock_a_indicator_lg(
+            symbol=p.get("symbol", ""), stock=p.get("stock", "")),
+        "stock_individual_info_em": lambda p: stock_individual_info_em(
+            symbol=p.get("symbol", "")),
+        "stock_hsgt_hold_stock_em": lambda p: stock_hsgt_hold_stock_em(
+            market=p.get("market", "北向"), indicator=p.get("indicator", "今日排行")),
+        "stock_zt_pool_em": lambda p: stock_zt_pool_em(
+            date=p.get("date", "")),
+        "stock_zt_pool_dtgc_em": lambda p: stock_zt_pool_dtgc_em(
+            date=p.get("date", "")),
+        "stock_board_concept_name_em": lambda p: stock_board_concept_name_em(),
+        "stock_board_concept_cons_em": lambda p: stock_board_concept_cons_em(
+            symbol=p.get("symbol", "")),
+        "stock_info_global_em": lambda p: stock_info_global_em(),
+        "stock_info_a_code_name": lambda p: stock_info_a_code_name(),
+    }
+
+    if func_name in _REDIRECT_MAP:
+        logger.info("Generic proxy redirected to dedicated endpoint", func=func_name)
+        return await _REDIRECT_MAP[func_name](params)
+
     # 安全检查
     if not func_name.startswith(ALLOWED_PREFIXES):
         raise HTTPException(
