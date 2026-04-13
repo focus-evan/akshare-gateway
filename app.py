@@ -2203,6 +2203,89 @@ async def stock_ipo_declare_em():
 
 
 # =====================================================================
+#  财务数据（当日精选深度分析核心依赖）
+# =====================================================================
+
+CACHE_TTL["stock_yjbb_em"]                    = 3600   # 业绩快报 1小时
+CACHE_TTL["stock_financial_abstract_ths"]     = 3600   # 同花顺财务摘要 1小时
+CACHE_TTL["stock_financial_analysis_indicator"] = 3600 # 通用财务指标 1小时
+
+
+@app.get("/api/stock/yjbb_em")
+async def stock_yjbb_em(
+    date: str = Query(..., description="报告期 YYYYMMDD，如 20240930"),
+):
+    """获取A股业绩快报（东方财富）— 含最新季度营收、净利润、同比增速"""
+    start = time.time()
+    func_name = "stock_yjbb_em"
+    try:
+        df = _cached_call(f"{func_name}:{date}", ak.stock_yjbb_em, date=date)
+        _record_stat(func_name, (time.time() - start) * 1000)
+        return _df_to_response(df)
+    except TypeError:
+        # akshare 版本不同参数名不一样，兜底无参调用
+        try:
+            df = _cached_call(func_name, ak.stock_yjbb_em)
+            _record_stat(func_name, (time.time() - start) * 1000)
+            return _df_to_response(df)
+        except Exception as e2:
+            _record_stat(func_name, (time.time() - start) * 1000, is_error=True)
+            raise HTTPException(status_code=500, detail=str(e2))
+    except Exception as e:
+        _record_stat(func_name, (time.time() - start) * 1000, is_error=True)
+        logger.error("stock_yjbb_em failed", date=date, error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/stock/financial_abstract_ths")
+async def stock_financial_abstract_ths(
+    symbol: str = Query(..., description="股票代码，如 600519"),
+    indicator: str = Query("按报告期", description="查询维度: 按报告期/按年度/按单季度"),
+):
+    """获取同花顺财务摘要（营收/净利润/ROE/毛利率等3季度趋势）"""
+    start = time.time()
+    func_name = "stock_financial_abstract_ths"
+    try:
+        df = _cached_call(
+            f"{func_name}:{symbol}:{indicator}",
+            ak.stock_financial_abstract_ths,
+            symbol=symbol,
+            indicator=indicator,
+        )
+        _record_stat(func_name, (time.time() - start) * 1000)
+        return _df_to_response(df)
+    except Exception as e:
+        _record_stat(func_name, (time.time() - start) * 1000, is_error=True)
+        logger.error("stock_financial_abstract_ths failed", symbol=symbol, error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/stock/financial_analysis_indicator")
+async def stock_financial_analysis_indicator(
+    symbol: str = Query(..., description="股票代码，如 600519"),
+    start_year: str = Query("", description="起始年份，如 2022"),
+):
+    """获取个股财务分析指标（通用兜底数据源）"""
+    start = time.time()
+    func_name = "stock_financial_analysis_indicator"
+    try:
+        kwargs = {"symbol": symbol}
+        if start_year:
+            kwargs["start_year"] = start_year
+        df = _cached_call(
+            f"{func_name}:{symbol}:{start_year}",
+            ak.stock_financial_analysis_indicator,
+            **kwargs,
+        )
+        _record_stat(func_name, (time.time() - start) * 1000)
+        return _df_to_response(df)
+    except Exception as e:
+        _record_stat(func_name, (time.time() - start) * 1000, is_error=True)
+        logger.error("stock_financial_analysis_indicator failed", symbol=symbol, error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =====================================================================
 #  通用带参数代理（万能接口）
 # =====================================================================
 
@@ -2262,6 +2345,15 @@ async def generic_akshare_proxy(func_name: str, request: Request):
             symbol=p.get("symbol", "")),
         "stock_info_global_em": lambda p: stock_info_global_em(),
         "stock_info_a_code_name": lambda p: stock_info_a_code_name(),
+        # 财务数据（当日精选深度分析）
+        "stock_yjbb_em": lambda p: stock_yjbb_em(
+            date=p.get("date", "")),
+        "stock_financial_abstract_ths": lambda p: stock_financial_abstract_ths(
+            symbol=p.get("symbol", ""),
+            indicator=p.get("indicator", "按报告期")),
+        "stock_financial_analysis_indicator": lambda p: stock_financial_analysis_indicator(
+            symbol=p.get("symbol", ""),
+            start_year=p.get("start_year", "")),
     }
 
     if func_name in _REDIRECT_MAP:
