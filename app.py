@@ -1783,53 +1783,17 @@ async def stock_hsgt_hold_stock_em(
     获取北向/沪深通持仓排名
 
     对应 akshare: ak.stock_hsgt_hold_stock_em(market, indicator)
-
-    特殊处理:
-    - "持股排行": akshare 不支持该 indicator，自动转换为
-      获取 "今日排行" 后按 "持股市值" 降序排列。
     """
     start = time.time()
     func_name = "stock_hsgt_hold_stock_em"
-
-    # akshare 只支持 今日排行/3日排行/5日排行/10日排行
-    # "持股排行" 需要特殊处理：取今日排行后按持股市值重排
-    actual_indicator = indicator
-    resort_by_hold_value = False
-    if indicator == "持股排行":
-        actual_indicator = "今日排行"
-        resort_by_hold_value = True
-
     try:
-        cache_name = f"{func_name}:{market}:{indicator}"
-        cache_k = _cache_key(cache_name)
-        cached = cache.get(cache_k)
-        if cached is not None:
-            _record_stat(func_name, (time.time() - start) * 1000, cache_hit=True)
-            return _df_to_response(cached)
-
-        df = _cached_call(f"{func_name}:{market}:{actual_indicator}",
-                          ak.stock_hsgt_hold_stock_em,
-                          market=market, indicator=actual_indicator)
-
-        # 对 "持股排行" 请求，按持股市值降序重排
-        if resort_by_hold_value and df is not None and not df.empty:
-            value_col = next((c for c in df.columns if '持股市值' in str(c)), None)
-            if value_col:
-                df[value_col] = pd.to_numeric(df[value_col], errors='coerce')
-                df = df.sort_values(value_col, ascending=False).reset_index(drop=True)
-                logger.info("Resorted by hold value for 持股排行",
-                            market=market, rows=len(df))
-
-        # 独立缓存持股排行和今日排行
-        if resort_by_hold_value:
-            cache.set(cache_k, df, _get_ttl(func_name))
-
+        df = _cached_call(func_name, ak.stock_hsgt_hold_stock_em,
+                          market=market, indicator=indicator)
         _record_stat(func_name, (time.time() - start) * 1000)
         return _df_to_response(df)
     except Exception as e:
         _record_stat(func_name, (time.time() - start) * 1000, is_error=True)
-        logger.error("stock_hsgt_hold_stock_em failed",
-                     market=market, indicator=indicator, error=str(e))
+        logger.error("stock_hsgt_hold_stock_em failed", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
