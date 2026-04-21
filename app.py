@@ -1833,27 +1833,33 @@ async def index_global_spot_em():
                     f"?secid={idx['secid']}"
                     f"&ut=fa5fd1943c7b386f172d6893dbfba10b"
                     f"&fields=f43,f44,f45,f46,f57,f58,f169,f170"
-                    f"&invt=2"
+                    f"&fltt=2&invt=2"
                 )
                 resp = req.get(url, headers=headers, timeout=10)
                 data = resp.json()
 
                 stock_data = data.get("data")
                 if stock_data:
-                    # f43=最新价, f170=涨跌幅, f169=涨跌额, f44=最高, f45=最低, f46=开盘
+                    # f43=最新价, f170=涨跌幅, f169=涨跌额
                     price = stock_data.get("f43", 0)
                     change_pct = stock_data.get("f170", 0)
                     change_amt = stock_data.get("f169", 0)
                     code = stock_data.get("f57", idx["secid"].split(".")[-1])
                     name = stock_data.get("f58", idx["name"])
 
-                    # 东财返回的价格可能需要除以100或1000
-                    if isinstance(price, (int, float)) and price > 100000:
-                        price = price / 100
-                    if isinstance(change_pct, (int, float)) and abs(change_pct) > 100:
-                        change_pct = change_pct / 100
-                    if isinstance(change_amt, (int, float)) and abs(change_amt) > 10000:
-                        change_amt = change_amt / 100
+                    # 打印原始值用于调试
+                    logger.info("Raw index data",
+                                secid=idx["secid"],
+                                raw_f43=price, raw_f170=change_pct,
+                                raw_f169=change_amt, raw_f58=name)
+
+                    # 确保是数字
+                    try:
+                        price = float(price) if price and price != "-" else 0
+                        change_pct = float(change_pct) if change_pct and change_pct != "-" else 0
+                        change_amt = float(change_amt) if change_amt and change_amt != "-" else 0
+                    except (ValueError, TypeError):
+                        price, change_pct, change_amt = 0, 0, 0
 
                     records.append({
                         "代码": code,
