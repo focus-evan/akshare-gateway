@@ -1797,6 +1797,26 @@ async def stock_hsgt_hold_stock_em(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/index/global_spot_em")
+async def index_global_spot_em():
+    """
+    获取全球主要股指实时行情
+
+    对应 akshare: ak.index_global_spot_em()
+    返回道琼斯、纳斯达克、标普500、恒生指数等全球指数的最新涨跌幅。
+    """
+    start = time.time()
+    func_name = "index_global_spot_em"
+    try:
+        df = _cached_call(func_name, ak.index_global_spot_em)
+        _record_stat(func_name, (time.time() - start) * 1000)
+        return _df_to_response(df)
+    except Exception as e:
+        _record_stat(func_name, (time.time() - start) * 1000, is_error=True)
+        logger.error("index_global_spot_em failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # =====================================================================
 #  资金流向排名
 # =====================================================================
