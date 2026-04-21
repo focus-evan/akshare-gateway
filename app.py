@@ -1802,104 +1802,89 @@ async def index_global_spot_em():
     """
     获取全球主要股指实时行情
 
-    直接调用东方财富 push2 API（绕过 akshare 反爬问题）。
-    返回道琼斯、纳斯达克、标普500、恒生指数等全球指数的最新涨跌幅。
+    逐个查询道琼斯/纳斯达克/标普500/恒生指数的实时涨跌幅。
+    使用东方财富 qt/stock/get API（最稳定的接口）。
     """
     start = time.time()
     func_name = "index_global_spot_em"
     try:
         import requests as req
 
-        # 尝试多个 fs 参数（不同版本的东财API可能不同）
-        fs_params = [
-            "m:1+s:2+t:2",           # 全球主要指数
-            "m:0+t:5",               # 备选
-            "b:MK0201",              # 全球指数板块
+        # secid 映射：市场代码.指数代码
+        indices = [
+            {"secid": "100.DJIA",  "name": "道琼斯"},
+            {"secid": "100.NDX",   "name": "纳斯达克"},
+            {"secid": "100.SPX",   "name": "标普500"},
+            {"secid": "100.HSI",   "name": "恒生指数"},
         ]
 
-        items = None
-        used_fs = ""
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Referer": "https://quote.eastmoney.com/",
+            "Accept": "*/*",
+        }
 
-        for fs in fs_params:
+        records = []
+        for idx in indices:
             try:
                 url = (
-                    f"https://push2.eastmoney.com/api/qt/clist/get"
-                    f"?pn=1&pz=100&po=1&np=1"
-                    f"&ut=bd1d9ddb04089700cf9c27f6f7426281"
-                    f"&fltt=2&invt=2&fid=f3"
-                    f"&fs={fs}"
-                    f"&fields=f1,f2,f3,f4,f12,f13,f14,f152"
+                    f"https://push2.eastmoney.com/api/qt/stock/get"
+                    f"?secid={idx['secid']}"
+                    f"&ut=fa5fd1943c7b386f172d6893dbfba10b"
+                    f"&fields=f43,f44,f45,f46,f57,f58,f169,f170"
+                    f"&invt=2"
                 )
-
-                headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                                  "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-                    "Referer": "https://quote.eastmoney.com/center/gridlist.html",
-                    "Accept": "application/json, text/plain, */*",
-                }
-
-                resp = req.get(url, headers=headers, timeout=15)
+                resp = req.get(url, headers=headers, timeout=10)
                 data = resp.json()
 
-                diff_data = data.get("data")
-                if diff_data is not None and isinstance(diff_data, dict):
-                    diff_list = diff_data.get("diff")
-                    if diff_list and len(diff_list) > 0:
-                        items = diff_list
-                        used_fs = fs
-                        logger.info("push2 API success", fs=fs, count=len(items))
-                        break
-                    else:
-                        logger.warning("push2 API empty diff", fs=fs,
-                                       raw_data_keys=list(diff_data.keys()) if diff_data else "None")
+                stock_data = data.get("data")
+                if stock_data:
+                    # f43=最新价, f170=涨跌幅, f169=涨跌额, f44=最高, f45=最低, f46=开盘
+                    price = stock_data.get("f43", 0)
+                    change_pct = stock_data.get("f170", 0)
+                    change_amt = stock_data.get("f169", 0)
+                    code = stock_data.get("f57", idx["secid"].split(".")[-1])
+                    name = stock_data.get("f58", idx["name"])
+
+                    # 东财返回的价格可能需要除以100或1000
+                    if isinstance(price, (int, float)) and price > 100000:
+                        price = price / 100
+                    if isinstance(change_pct, (int, float)) and abs(change_pct) > 100:
+                        change_pct = change_pct / 100
+                    if isinstance(change_amt, (int, float)) and abs(change_amt) > 10000:
+                        change_amt = change_amt / 100
+
+                    records.append({
+                        "代码": code,
+                        "名称": name if name != "-" else idx["name"],
+                        "最新价": price,
+                        "涨跌额": change_amt,
+                        "涨跌幅": round(float(change_pct), 2) if change_pct else 0,
+                    })
+                    logger.debug("Fetched index", secid=idx["secid"],
+                                 name=idx["name"], pct=change_pct)
                 else:
-                    logger.warning("push2 API data is None", fs=fs,
-                                   raw_keys=list(data.keys()) if data else "None",
-                                   rc=data.get("rc"), msg=data.get("msg", ""))
-            except Exception as fs_e:
-                logger.warning("push2 API attempt failed", fs=fs, error=str(fs_e))
+                    logger.warning("Empty data for index", secid=idx["secid"],
+                                   raw_keys=list(data.keys()) if data else "None")
+
+            except Exception as idx_e:
+                logger.warning("Failed to fetch index",
+                               secid=idx["secid"], error=str(idx_e))
                 continue
 
-        if items:
-            # 转换为标准格式
-            records = []
-            for item in items:
-                name = item.get("f14", "")
-                pct = item.get("f3", 0)
-                # 跳过无效数据
-                if pct == "-" or name == "-":
-                    continue
-                try:
-                    pct = float(pct) if pct else 0
-                except (ValueError, TypeError):
-                    pct = 0
-
-                records.append({
-                    "序号": item.get("f1", 0),
-                    "代码": item.get("f12", ""),
-                    "名称": name,
-                    "最新价": item.get("f2", 0),
-                    "涨跌额": item.get("f4", 0),
-                    "涨跌幅": pct,
-                })
-
-            logger.info("Global index from push2 API ✅",
-                         fs=used_fs,
+        if records:
+            logger.info("Global index fetched ✅",
                          count=len(records),
-                         sample=[f"{r['名称']}:{r['涨跌幅']}%" for r in records[:5]])
-
+                         detail=[f"{r['名称']}:{r['涨跌幅']}%" for r in records])
             _record_stat(func_name, (time.time() - start) * 1000)
             return {"data": records, "count": len(records)}
 
-        # push2 全部失败，fallback to akshare
-        logger.warning("push2 API all fs params failed, trying akshare fallback")
-        try:
-            df = _cached_call(func_name, ak.index_global_spot_em)
-            _record_stat(func_name, (time.time() - start) * 1000)
-            return _df_to_response(df)
-        except Exception as ak_e:
-            logger.error("akshare fallback also failed", error=str(ak_e))
-            raise HTTPException(status_code=500, detail=f"push2 and akshare both failed: {str(ak_e)}")
+        # 全部失败，尝试 akshare fallback
+        logger.warning("All individual index queries failed, trying akshare fallback")
+        df = _cached_call(func_name, ak.index_global_spot_em)
+        _record_stat(func_name, (time.time() - start) * 1000)
+        return _df_to_response(df)
 
     except Exception as e:
         _record_stat(func_name, (time.time() - start) * 1000, is_error=True)
