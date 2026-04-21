@@ -1802,15 +1802,62 @@ async def index_global_spot_em():
     """
     获取全球主要股指实时行情
 
-    对应 akshare: ak.index_global_spot_em()
+    直接调用东方财富 push2 API（绕过 akshare 反爬问题）。
     返回道琼斯、纳斯达克、标普500、恒生指数等全球指数的最新涨跌幅。
     """
     start = time.time()
     func_name = "index_global_spot_em"
     try:
-        df = _cached_call(func_name, ak.index_global_spot_em)
+        import requests as req
+
+        # 东方财富全球指数 push2 API
+        # fs 参数: m:1+s:2+t:2 = 全球主要指数
+        url = (
+            "https://push2.eastmoney.com/api/qt/clist/get"
+            "?pn=1&pz=100&po=1&np=1"
+            "&ut=bd1d9ddb04089700cf9c27f6f7426281"
+            "&fltt=2&invt=2&fid=f3"
+            "&fs=m:1+s:2+t:2"
+            "&fields=f1,f2,f3,f4,f12,f13,f14,f152"
+        )
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Referer": "https://quote.eastmoney.com/center/gridlist.html",
+            "Accept": "application/json, text/plain, */*",
+        }
+
+        resp = req.get(url, headers=headers, timeout=15)
+        data = resp.json()
+
+        items = data.get("data", {}).get("diff", [])
+        if not items:
+            logger.warning("push2 global index returned empty diff")
+            # fallback to akshare
+            df = _cached_call(func_name, ak.index_global_spot_em)
+            _record_stat(func_name, (time.time() - start) * 1000)
+            return _df_to_response(df)
+
+        # 转换为标准格式
+        records = []
+        for item in items:
+            records.append({
+                "序号": item.get("f1", 0),
+                "代码": item.get("f12", ""),
+                "名称": item.get("f14", ""),
+                "最新价": item.get("f2", 0),
+                "涨跌额": item.get("f4", 0),
+                "涨跌幅": item.get("f3", 0),
+            })
+
+        logger.info("Global index from push2 API",
+                     count=len(records),
+                     sample=[f"{r['名称']}:{r['涨跌幅']}%" for r in records[:5]])
+
         _record_stat(func_name, (time.time() - start) * 1000)
-        return _df_to_response(df)
+        return {"data": records, "count": len(records)}
+
     except Exception as e:
         _record_stat(func_name, (time.time() - start) * 1000, is_error=True)
         logger.error("index_global_spot_em failed", error=str(e))
