@@ -1810,53 +1810,96 @@ async def index_global_spot_em():
     try:
         import requests as req
 
-        # 东方财富全球指数 push2 API
-        # fs 参数: m:1+s:2+t:2 = 全球主要指数
-        url = (
-            "https://push2.eastmoney.com/api/qt/clist/get"
-            "?pn=1&pz=100&po=1&np=1"
-            "&ut=bd1d9ddb04089700cf9c27f6f7426281"
-            "&fltt=2&invt=2&fid=f3"
-            "&fs=m:1+s:2+t:2"
-            "&fields=f1,f2,f3,f4,f12,f13,f14,f152"
-        )
+        # 尝试多个 fs 参数（不同版本的东财API可能不同）
+        fs_params = [
+            "m:1+s:2+t:2",           # 全球主要指数
+            "m:0+t:5",               # 备选
+            "b:MK0201",              # 全球指数板块
+        ]
 
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            "Referer": "https://quote.eastmoney.com/center/gridlist.html",
-            "Accept": "application/json, text/plain, */*",
-        }
+        items = None
+        used_fs = ""
 
-        resp = req.get(url, headers=headers, timeout=15)
-        data = resp.json()
+        for fs in fs_params:
+            try:
+                url = (
+                    f"https://push2.eastmoney.com/api/qt/clist/get"
+                    f"?pn=1&pz=100&po=1&np=1"
+                    f"&ut=bd1d9ddb04089700cf9c27f6f7426281"
+                    f"&fltt=2&invt=2&fid=f3"
+                    f"&fs={fs}"
+                    f"&fields=f1,f2,f3,f4,f12,f13,f14,f152"
+                )
 
-        items = data.get("data", {}).get("diff", [])
-        if not items:
-            logger.warning("push2 global index returned empty diff")
-            # fallback to akshare
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                  "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                    "Referer": "https://quote.eastmoney.com/center/gridlist.html",
+                    "Accept": "application/json, text/plain, */*",
+                }
+
+                resp = req.get(url, headers=headers, timeout=15)
+                data = resp.json()
+
+                diff_data = data.get("data")
+                if diff_data is not None and isinstance(diff_data, dict):
+                    diff_list = diff_data.get("diff")
+                    if diff_list and len(diff_list) > 0:
+                        items = diff_list
+                        used_fs = fs
+                        logger.info("push2 API success", fs=fs, count=len(items))
+                        break
+                    else:
+                        logger.warning("push2 API empty diff", fs=fs,
+                                       raw_data_keys=list(diff_data.keys()) if diff_data else "None")
+                else:
+                    logger.warning("push2 API data is None", fs=fs,
+                                   raw_keys=list(data.keys()) if data else "None",
+                                   rc=data.get("rc"), msg=data.get("msg", ""))
+            except Exception as fs_e:
+                logger.warning("push2 API attempt failed", fs=fs, error=str(fs_e))
+                continue
+
+        if items:
+            # 转换为标准格式
+            records = []
+            for item in items:
+                name = item.get("f14", "")
+                pct = item.get("f3", 0)
+                # 跳过无效数据
+                if pct == "-" or name == "-":
+                    continue
+                try:
+                    pct = float(pct) if pct else 0
+                except (ValueError, TypeError):
+                    pct = 0
+
+                records.append({
+                    "序号": item.get("f1", 0),
+                    "代码": item.get("f12", ""),
+                    "名称": name,
+                    "最新价": item.get("f2", 0),
+                    "涨跌额": item.get("f4", 0),
+                    "涨跌幅": pct,
+                })
+
+            logger.info("Global index from push2 API ✅",
+                         fs=used_fs,
+                         count=len(records),
+                         sample=[f"{r['名称']}:{r['涨跌幅']}%" for r in records[:5]])
+
+            _record_stat(func_name, (time.time() - start) * 1000)
+            return {"data": records, "count": len(records)}
+
+        # push2 全部失败，fallback to akshare
+        logger.warning("push2 API all fs params failed, trying akshare fallback")
+        try:
             df = _cached_call(func_name, ak.index_global_spot_em)
             _record_stat(func_name, (time.time() - start) * 1000)
             return _df_to_response(df)
-
-        # 转换为标准格式
-        records = []
-        for item in items:
-            records.append({
-                "序号": item.get("f1", 0),
-                "代码": item.get("f12", ""),
-                "名称": item.get("f14", ""),
-                "最新价": item.get("f2", 0),
-                "涨跌额": item.get("f4", 0),
-                "涨跌幅": item.get("f3", 0),
-            })
-
-        logger.info("Global index from push2 API",
-                     count=len(records),
-                     sample=[f"{r['名称']}:{r['涨跌幅']}%" for r in records[:5]])
-
-        _record_stat(func_name, (time.time() - start) * 1000)
-        return {"data": records, "count": len(records)}
+        except Exception as ak_e:
+            logger.error("akshare fallback also failed", error=str(ak_e))
+            raise HTTPException(status_code=500, detail=f"push2 and akshare both failed: {str(ak_e)}")
 
     except Exception as e:
         _record_stat(func_name, (time.time() - start) * 1000, is_error=True)
