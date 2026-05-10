@@ -1651,19 +1651,25 @@ async def stock_zh_a_hist(
 
 @app.get("/api/stock/a_indicator_lg")
 async def stock_a_indicator_lg(
-    symbol: str = Query(..., description="股票代码，如 600519"),
+    symbol: str = Query("", description="股票代码，如 600519"),
+    stock: str = Query("", description="股票代码（兼容旧参数名）"),
 ):
     """
-    获取个股 PE/PB/PS 等估值指标历史数据（乐咕乐估）
+    获取个股 PE/PB/PS 等估值指标历史数据
 
-    兼容新旧版本 akshare API 名称变化:
-    - stock_a_indicator_lg(symbol=xxx) — 新版按个股查询
-    - stock_a_ttm_lyr() — 旧版返回全量数据，需按代码过滤
+    兼容多版本 akshare API:
+    - stock_a_indicator_lg(symbol=xxx) — 旧版专用接口（已在 1.18+ 移除）
+    - stock_zh_valuation_baidu(symbol=xxx) — 新版替代（百度股市通）
+    - stock_a_ttm_lyr() — 全量市场数据兜底
     """
     start = time.time()
     func_name = "stock_a_indicator_lg"
+    # 兼容 symbol 和 stock 两种参数名
+    symbol = symbol or stock
+    if not symbol:
+        raise HTTPException(status_code=400, detail="缺少 symbol 参数")
     try:
-        # ---- 阶段1: 尝试带参数的 API（新版 akshare）----
+        # ---- 阶段1: 尝试旧版 API（akshare < 1.18）----
         candidates = [
             ('stock_a_indicator_lg', 'symbol'),
             ('stock_a_lg_indicator', 'symbol'),
@@ -1692,7 +1698,59 @@ async def stock_a_indicator_lg(
                 logger.warning(f"{api_name} failed", error=str(e))
                 continue
 
-        # ---- 阶段2: stock_a_ttm_lyr() 无参数版本，返回全量再过滤 ----
+        # ---- 阶段2: stock_zh_valuation_baidu（百度股市通，akshare 1.18+）----
+        baidu_func = getattr(ak, 'stock_zh_valuation_baidu', None)
+        if baidu_func is not None:
+            try:
+                logger.info("Trying stock_zh_valuation_baidu fallback", symbol=symbol)
+                pe_df = None
+                pb_df = None
+
+                # 获取 PE(TTM)
+                try:
+                    cache_key_pe = f"baidu_pe_{symbol}"
+                    pe_raw = _cached_call(cache_key_pe, baidu_func,
+                                          symbol=symbol, indicator="市盈率(TTM)")
+                    if pe_raw is not None and not pe_raw.empty:
+                        pe_df = pe_raw.rename(columns={"value": "pe_ttm"})
+                except Exception as e:
+                    logger.warning("Baidu PE fetch failed", symbol=symbol, error=str(e))
+
+                # 获取 PB
+                _smart_rate_limit()
+                try:
+                    cache_key_pb = f"baidu_pb_{symbol}"
+                    pb_raw = _cached_call(cache_key_pb, baidu_func,
+                                          symbol=symbol, indicator="市净率")
+                    if pb_raw is not None and not pb_raw.empty:
+                        pb_df = pb_raw.rename(columns={"value": "pb"})
+                except Exception as e:
+                    logger.warning("Baidu PB fetch failed", symbol=symbol, error=str(e))
+
+                # 合并 PE + PB
+                if pe_df is not None and not pe_df.empty:
+                    result_df = pe_df.copy()
+                    if pb_df is not None and not pb_df.empty:
+                        result_df = result_df.merge(pb_df[['date', 'pb']], on='date', how='left')
+                    else:
+                        result_df['pb'] = None
+
+                    # 补充空列以兼容下游期望的格式
+                    for col in ['ps_ttm', 'dv_ttm']:
+                        if col not in result_df.columns:
+                            result_df[col] = None
+
+                    _record_stat(func_name, (time.time() - start) * 1000)
+                    logger.info("stock_zh_valuation_baidu success",
+                                symbol=symbol, rows=len(result_df))
+                    return _df_to_response(result_df)
+
+            except Exception as e:
+                logger.warning("stock_zh_valuation_baidu fallback failed",
+                               symbol=symbol, error=str(e))
+                last_err = e
+
+        # ---- 阶段3: stock_a_ttm_lyr() 全量市场兜底 ----
         ttm_func = getattr(ak, 'stock_a_ttm_lyr', None)
         if ttm_func is not None:
             try:
@@ -1707,7 +1765,6 @@ async def stock_a_indicator_lg(
                             code_col = col
                             break
                     if code_col:
-                        # 过滤出目标股票（支持 600519 和 sh600519 格式）
                         mask = df_all[code_col].astype(str).str.contains(symbol)
                         df = df_all[mask].copy()
                         if not df.empty:
@@ -1715,14 +1772,8 @@ async def stock_a_indicator_lg(
                             logger.info("stock_a_ttm_lyr filtered",
                                         symbol=symbol, rows=len(df))
                             return _df_to_response(df)
-                    else:
-                        # 没找到代码列，返回全部数据
-                        _record_stat(func_name, (time.time() - start) * 1000)
-                        logger.info("stock_a_ttm_lyr returned all (no code col found)",
-                                    rows=len(df_all))
-                        return _df_to_response(df_all)
             except Exception as e:
-                logger.warning("stock_a_ttm_lyr() no-arg call failed", error=str(e))
+                logger.warning("stock_a_ttm_lyr() fallback failed", error=str(e))
                 last_err = e
 
         if last_err:
