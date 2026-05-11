@@ -2447,6 +2447,39 @@ ALLOWED_PREFIXES = (
     "futures_", "option_", "forex_", "crypto_",
 )
 
+async def _generic_fund_flow_call(func_name: str, params: dict):
+    """
+    行业/概念资金流向调用（兼容 akshare 参数升级: sector→symbol）
+
+    旧版 akshare: ak.stock_fund_flow_industry(sector="行业资金流向")
+    新版 akshare: ak.stock_fund_flow_industry(symbol="即时")
+    """
+    start = time.time()
+
+    # 兼容旧参数名：sector → symbol
+    symbol = params.get("symbol") or params.get("sector", "即时")
+    # 旧版 sector 值映射到新版 symbol 值
+    _SECTOR_TO_SYMBOL = {
+        "行业资金流向": "即时",
+        "概念资金流向": "即时",
+        "今日": "即时",
+    }
+    symbol = _SECTOR_TO_SYMBOL.get(symbol, symbol)
+
+    func = getattr(ak, func_name, None)
+    if func is None:
+        raise HTTPException(status_code=404, detail=f"akshare 无此函数: {func_name}")
+
+    try:
+        df = _cached_call(func_name, func, symbol=symbol)
+        _record_stat(func_name, (time.time() - start) * 1000)
+        return _df_to_response(df)
+    except Exception as e:
+        _record_stat(func_name, (time.time() - start) * 1000, is_error=True)
+        logger.error("Fund flow call failed", func=func_name, symbol=symbol,
+                     error=str(e), trace=traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/api/akshare/{func_name}")
 async def generic_akshare_proxy(func_name: str, request: Request):
@@ -2506,6 +2539,11 @@ async def generic_akshare_proxy(func_name: str, request: Request):
         "stock_financial_analysis_indicator": lambda p: stock_financial_analysis_indicator(
             symbol=p.get("symbol", ""),
             start_year=p.get("start_year", "")),
+        # 行业/概念资金流向（akshare 升级: sector→symbol）
+        "stock_fund_flow_industry": lambda p: _generic_fund_flow_call(
+            "stock_fund_flow_industry", p),
+        "stock_fund_flow_concept": lambda p: _generic_fund_flow_call(
+            "stock_fund_flow_concept", p),
     }
 
     if func_name in _REDIRECT_MAP:
