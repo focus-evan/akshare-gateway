@@ -264,8 +264,10 @@ CACHE_TTL = {
     # 全市场行情 — 1分钟（高频变化）
     "stock_zh_a_spot_em": 60,
     "stock_hk_spot_em": 60,
+    "stock_zh_a_spot_full": 60,
     # 个股历史K线 — 5分钟
     "stock_zh_a_hist": 300,
+    "dragon_minute_bars": 120,
     # 个股指标 — 5分钟（PE/PB分位不常变）
     "stock_a_indicator_lg": 300,
     "stock_individual_info_em": 300,
@@ -275,6 +277,7 @@ CACHE_TTL = {
     # 涨停/跌停池 — 2分钟
     "stock_zt_pool_em": 120,
     "stock_zt_pool_dtgc_em": 120,
+    "dragon_limit_up_analysis": 120,
     # 北向资金 — 3分钟
     "stock_hsgt_hold_stock_em": 180,
     "stock_individual_fund_flow_rank": 180,
@@ -496,6 +499,387 @@ def _df_to_response(df: Optional[pd.DataFrame], name: str = "data") -> Response:
         default=str,  # 最终兆底：任何无法序列化的类型都转为字符串
     )
     return Response(content=body, media_type="application/json")
+
+
+def _degraded_df_to_response(
+    df: Optional[pd.DataFrame],
+    *,
+    source: str,
+    is_realtime: bool,
+    data_timestamp: str,
+    degraded: bool,
+    fallback_level: str,
+    schema_version: str = "dragon-v1",
+) -> Response:
+    """为龙头战法专用端点返回带 freshness 元信息的响应。"""
+    if df is None or df.empty:
+        body = json.dumps(
+            {
+                "status": "ok",
+                "count": 0,
+                "data": [],
+                "meta": {
+                    "source": source,
+                    "is_realtime": is_realtime,
+                    "data_timestamp": data_timestamp,
+                    "degraded": degraded,
+                    "fallback_level": fallback_level,
+                    "schema_version": schema_version,
+                },
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+        return Response(content=body, media_type="application/json")
+
+    import numpy as np
+    df = df.replace([np.inf, -np.inf], None)
+    df = df.where(pd.notnull(df), None)
+
+    for col in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            df[col] = df[col].astype(str).replace('NaT', None)
+
+    records = _safe_serialize(df.to_dict(orient="records"))
+    body = json.dumps(
+        {
+            "status": "ok",
+            "count": len(records),
+            "data": records,
+            "meta": {
+                "source": source,
+                "is_realtime": is_realtime,
+                "data_timestamp": data_timestamp,
+                "degraded": degraded,
+                "fallback_level": fallback_level,
+                "schema_version": schema_version,
+            },
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+    return Response(content=body, media_type="application/json")
+
+
+def _normalize_stock_code(symbol: str) -> str:
+    code = str(symbol or "").strip().upper()
+    if not code:
+        return ""
+    if code.startswith(("SH", "SZ", "BJ")):
+        code = code[2:]
+    return code.zfill(6)
+
+
+def _normalize_minute_bars_df(df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["datetime", "open", "high", "low", "close", "volume", "amount"])
+
+    frame = df.copy()
+    col_map = {}
+    for col in frame.columns:
+        col_str = str(col)
+        if col_str in ("时间", "日期", "day", "datetime", "date"):
+            col_map[col] = "datetime"
+        elif col_str in ("开盘", "open"):
+            col_map[col] = "open"
+        elif col_str in ("最高", "high"):
+            col_map[col] = "high"
+        elif col_str in ("最低", "low"):
+            col_map[col] = "low"
+        elif col_str in ("收盘", "close", "最新价"):
+            col_map[col] = "close"
+        elif col_str in ("成交量", "volume"):
+            col_map[col] = "volume"
+        elif col_str in ("成交额", "amount"):
+            col_map[col] = "amount"
+    frame = frame.rename(columns=col_map)
+
+    if "datetime" not in frame.columns:
+        frame["datetime"] = list(range(len(frame)))
+
+    for col in ["open", "high", "low", "close", "volume", "amount"]:
+        if col not in frame.columns:
+            frame[col] = 0
+        frame[col] = pd.to_numeric(frame[col], errors="coerce")
+
+    frame["datetime"] = frame["datetime"].astype(str)
+    frame = frame[["datetime", "open", "high", "low", "close", "volume", "amount"]].copy()
+    return frame.where(pd.notnull(frame), None)
+
+
+def _fetch_minute_bars(symbol: str, period: str) -> pd.DataFrame:
+    code = _normalize_stock_code(symbol)
+    if not code:
+        return pd.DataFrame()
+
+    candidates = [
+        (getattr(ak, "stock_zh_a_hist_min_em", None), {"symbol": code, "period": period, "adjust": "qfq"}),
+        (getattr(ak, "stock_zh_a_hist_min_em", None), {"symbol": code, "period": period}),
+        (getattr(ak, "stock_zh_a_minute", None), {"symbol": code, "period": period, "adjust": "qfq"}),
+        (getattr(ak, "stock_zh_a_minute", None), {"symbol": code, "period": period}),
+    ]
+
+    for func, kwargs in candidates:
+        if func is None:
+            continue
+        try:
+            df = _retry(func, max_retries=2, delay=1.2, **kwargs)
+            if df is not None and not df.empty:
+                return _normalize_minute_bars_df(df)
+        except Exception as e:
+            logger.warning("Minute bars source failed", symbol=code, period=period, func=getattr(func, "__name__", "unknown"), error=str(e)[:160])
+            continue
+
+    return pd.DataFrame()
+
+
+def _normalize_spot_df(df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    frame = df.copy()
+    col_map = {}
+    for col in frame.columns:
+        col_str = str(col)
+        if "代码" in col_str and "代码" not in col_map.values():
+            col_map[col] = "代码"
+        elif "名称" in col_str and "名称" not in col_map.values():
+            col_map[col] = "名称"
+        elif ("最新价" in col_str or col_str == "收盘") and "最新价" not in col_map.values():
+            col_map[col] = "最新价"
+        elif "涨跌幅" in col_str and "涨跌幅" not in col_map.values():
+            col_map[col] = "涨跌幅"
+        elif "今开" in col_str and "今开" not in col_map.values():
+            col_map[col] = "今开"
+        elif "昨收" in col_str and "昨收" not in col_map.values():
+            col_map[col] = "昨收"
+        elif "成交额" in col_str and "成交额" not in col_map.values():
+            col_map[col] = "成交额"
+        elif "成交量" in col_str and "成交量" not in col_map.values():
+            col_map[col] = "成交量"
+        elif "换手率" in col_str and "换手率" not in col_map.values():
+            col_map[col] = "换手率"
+        elif "流通市值" in col_str and "流通市值" not in col_map.values():
+            col_map[col] = "流通市值"
+        elif "总市值" in col_str and "总市值" not in col_map.values():
+            col_map[col] = "总市值"
+        elif "最高" in col_str and "最高" not in col_map.values():
+            col_map[col] = "最高"
+        elif "最低" in col_str and "最低" not in col_map.values():
+            col_map[col] = "最低"
+    frame = frame.rename(columns=col_map)
+    if "代码" in frame.columns:
+        frame["代码"] = frame["代码"].astype(str).str.extract(r'(\d{6})', expand=False).fillna(frame["代码"].astype(str)).str.zfill(6)
+    return frame
+
+
+def _fetch_concept_cons_df(symbol: str) -> pd.DataFrame:
+    """同步获取概念成份股 DataFrame，供龙头战法内部复用。"""
+    cache_k = _cache_key(f"stock_board_concept_cons_em:{symbol}")
+    cached = cache.get(cache_k)
+    if cached is not None:
+        return cached
+
+    # 数据源1: akshare东财接口
+    try:
+        _smart_rate_limit()
+        df = _retry(ak.stock_board_concept_cons_em, max_retries=2, delay=2.0, symbol=symbol)
+        if df is not None and not df.empty:
+            cache.set(cache_k, df, 300)
+            return df
+    except Exception as em_err:
+        logger.warning("东财akshare概念成份失败", symbol=symbol, error=str(em_err)[:150])
+
+    # 数据源2: 直连东财多域名API
+    try:
+        _record_success()
+        _reset_connections()
+        time.sleep(random.uniform(1.0, 2.0))
+        df = _fetch_concept_cons_direct_em(symbol)
+        if df is not None and not df.empty:
+            cache.set(cache_k, df, 300)
+            _record_success()
+            return df
+    except Exception as direct_err:
+        logger.warning("直连东财概念成份失败", symbol=symbol, error=str(direct_err)[:150])
+
+    # 数据源3: 同花顺
+    try:
+        _record_success()
+        _reset_connections()
+        time.sleep(random.uniform(0.5, 1.5))
+        df = _retry(ak.stock_board_concept_cons_ths, max_retries=1, delay=1.0, symbol=symbol)
+        if df is not None and not df.empty:
+            cache.set(cache_k, df, 300)
+            _record_success()
+            return df
+    except Exception as ths_err:
+        logger.warning("同花顺概念成份失败", symbol=symbol, error=str(ths_err)[:150])
+
+    with cache._lock:
+        if cache_k in cache._store:
+            stale_data, _ = cache._store[cache_k]
+            logger.warning("概念成份返回过期缓存", symbol=symbol)
+            return stale_data
+
+    return pd.DataFrame()
+
+
+def _build_stock_theme_mapping_from_boards(board_names: List[str]) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    for board_name in board_names:
+        if not board_name:
+            continue
+        try:
+            cons_df = _fetch_concept_cons_df(board_name)
+            if cons_df is None or cons_df.empty:
+                continue
+            cons_df = _normalize_spot_df(cons_df)
+            code_col = "代码" if "代码" in cons_df.columns else None
+            name_col = "名称" if "名称" in cons_df.columns else None
+            if not code_col:
+                continue
+            for _, row in cons_df.iterrows():
+                rows.append({
+                    "stock_code": str(row.get(code_col, "")).zfill(6),
+                    "stock_name": str(row.get(name_col, "")) if name_col else "",
+                    "theme_name": board_name,
+                })
+        except Exception as e:
+            logger.warning("Theme mapping build failed", theme=board_name, error=str(e)[:160])
+            continue
+    return pd.DataFrame(rows)
+
+
+def _resolve_stock_themes(symbol: str) -> pd.DataFrame:
+    code = _normalize_stock_code(symbol)
+    if not code:
+        return pd.DataFrame()
+
+    concepts = _multi_source_call(
+        sources=[
+            ("eastmoney", ak.stock_board_concept_name_em, {}),
+            ("ths", ak.stock_board_concept_name_ths, {}),
+        ],
+        cache_name="dragon_theme_name_pool",
+        cache_ttl=600,
+    )
+    if concepts is None or concepts.empty:
+        return pd.DataFrame()
+
+    name_col = None
+    for col in concepts.columns:
+        if "板块名称" in str(col) or "概念名称" in str(col):
+            name_col = col
+            break
+    if name_col is None:
+        return pd.DataFrame()
+
+    board_names = concepts[name_col].dropna().astype(str).head(40).tolist()
+    mapping = _build_stock_theme_mapping_from_boards(board_names)
+    if mapping.empty:
+        return mapping
+    return mapping[mapping["stock_code"] == code].reset_index(drop=True)
+
+
+def _extract_limit_up_days(value: Any) -> int:
+    if value is None:
+        return 0
+    try:
+        text = str(value).strip()
+        if "/" in text:
+            text = text.split("/")[0]
+        return int(float(text))
+    except Exception:
+        return 0
+
+
+def _build_limit_up_analysis(date_str: str) -> pd.DataFrame:
+    df = _cached_call("stock_zt_pool_em", ak.stock_zt_pool_em, date=date_str)
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    frame = df.copy()
+    col_map = {}
+    for col in frame.columns:
+        col_str = str(col)
+        if "代码" in col_str and "stock_code" not in col_map.values():
+            col_map[col] = "stock_code"
+        elif "名称" in col_str and "stock_name" not in col_map.values():
+            col_map[col] = "stock_name"
+        elif ("最新价" in col_str or col_str == "收盘") and "price" not in col_map.values():
+            col_map[col] = "price"
+        elif "涨跌幅" in col_str and "change_pct" not in col_map.values():
+            col_map[col] = "change_pct"
+        elif "成交额" in col_str and "amount" not in col_map.values():
+            col_map[col] = "amount"
+        elif "换手率" in col_str and "turnover_rate" not in col_map.values():
+            col_map[col] = "turnover_rate"
+        elif "流通市值" in col_str and "float_market_cap" not in col_map.values():
+            col_map[col] = "float_market_cap"
+        elif "总市值" in col_str and "total_market_cap" not in col_map.values():
+            col_map[col] = "total_market_cap"
+        elif "首次封板" in col_str or "封板时间" in col_str:
+            if "first_limit_time" not in col_map.values():
+                col_map[col] = "first_limit_time"
+        elif "封单" in col_str and "seal_amount" not in col_map.values():
+            col_map[col] = "seal_amount"
+        elif "所属行业" in col_str or ("行业" in col_str and "industry" not in col_map.values()):
+            col_map[col] = "industry"
+        elif "连板数" in col_str and "limit_up_days_raw" not in col_map.values():
+            col_map[col] = "limit_up_days_raw"
+        elif "涨停统计" in col_str and "zt_stat" not in col_map.values():
+            col_map[col] = "zt_stat"
+        elif "炸板" in col_str and "break_board_count" not in col_map.values():
+            col_map[col] = "break_board_count"
+    frame = frame.rename(columns=col_map)
+
+    if "stock_code" in frame.columns:
+        frame["stock_code"] = frame["stock_code"].astype(str).str.extract(r'(\d{6})', expand=False).fillna(frame["stock_code"].astype(str)).str.zfill(6)
+    else:
+        frame["stock_code"] = ""
+
+    if "limit_up_days_raw" not in frame.columns:
+        frame["limit_up_days_raw"] = frame.get("zt_stat")
+    frame["limit_up_days"] = frame["limit_up_days_raw"].apply(_extract_limit_up_days)
+
+    if "break_board_count" not in frame.columns:
+        frame["break_board_count"] = 0
+    frame["break_board_count"] = pd.to_numeric(frame["break_board_count"], errors="coerce").fillna(0).astype(int)
+
+    concepts = _multi_source_call(
+        sources=[
+            ("eastmoney", ak.stock_board_concept_name_em, {}),
+            ("ths", ak.stock_board_concept_name_ths, {}),
+        ],
+        cache_name="dragon_theme_name_pool",
+        cache_ttl=600,
+    )
+    theme_names: List[str] = []
+    if concepts is not None and not concepts.empty:
+        name_col = None
+        for col in concepts.columns:
+            if "板块名称" in str(col) or "概念名称" in str(col):
+                name_col = col
+                break
+        if name_col:
+            theme_names = concepts[name_col].dropna().astype(str).head(30).tolist()
+
+    theme_map = _build_stock_theme_mapping_from_boards(theme_names)
+    grouped = theme_map.groupby("stock_code")["theme_name"].apply(list).to_dict() if not theme_map.empty else {}
+
+    frame["themes"] = frame["stock_code"].map(lambda code: grouped.get(code, []))
+    frame["theme_count"] = frame["themes"].map(len)
+    frame["data_timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    keep_cols = [
+        "stock_code", "stock_name", "price", "change_pct", "amount", "turnover_rate",
+        "float_market_cap", "total_market_cap", "limit_up_days", "first_limit_time",
+        "seal_amount", "industry", "break_board_count", "themes", "theme_count", "data_timestamp",
+    ]
+    for col in keep_cols:
+        if col not in frame.columns:
+            frame[col] = None
+    return frame[keep_cols]
 
 
 def _reset_connections():
@@ -1595,6 +1979,190 @@ async def stock_hk_spot_em():
     except Exception as e:
         _record_stat(func_name, (time.time() - start) * 1000, is_error=True)
         logger.error("港股行情全部数据源失败", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/dragon/minute-bars")
+async def dragon_minute_bars(
+    symbol: str = Query(..., description="股票代码，如 600519"),
+    period: str = Query("1", description="分钟周期: 1/5/15/30/60"),
+):
+    """龙头战法专用分钟级K线。"""
+    start = time.time()
+    func_name = "dragon_minute_bars"
+    normalized_symbol = _normalize_stock_code(symbol)
+    try:
+        df = _cached_call(func_name, _fetch_minute_bars, symbol=normalized_symbol, period=period)
+        _record_stat(func_name, (time.time() - start) * 1000)
+        return _degraded_df_to_response(
+            df,
+            source="akshare-minute",
+            is_realtime=True,
+            data_timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            degraded=False,
+            fallback_level="none",
+            schema_version="dragon-v1",
+        )
+    except Exception as e:
+        _record_stat(func_name, (time.time() - start) * 1000, is_error=True)
+        logger.error("dragon_minute_bars failed", symbol=normalized_symbol, period=period, error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/dragon/stock-themes")
+async def dragon_stock_themes(
+    symbol: str = Query(..., description="股票代码，如 600519"),
+):
+    """龙头战法专用：反查个股所属题材列表。"""
+    start = time.time()
+    func_name = "dragon_stock_themes"
+    normalized_symbol = _normalize_stock_code(symbol)
+    try:
+        df = _cached_call(func_name, _resolve_stock_themes, symbol=normalized_symbol)
+        _record_stat(func_name, (time.time() - start) * 1000)
+        return _degraded_df_to_response(
+            df,
+            source="concept-cons-mapping",
+            is_realtime=False,
+            data_timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            degraded=False,
+            fallback_level="none",
+            schema_version="dragon-v1",
+        )
+    except Exception as e:
+        _record_stat(func_name, (time.time() - start) * 1000, is_error=True)
+        logger.error("dragon_stock_themes failed", symbol=normalized_symbol, error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/dragon/limit-up-analysis")
+async def dragon_limit_up_analysis(
+    date: str = Query(..., description="日期 YYYYMMDD"),
+):
+    """龙头战法专用：标准化涨停结构输出。"""
+    start = time.time()
+    func_name = "dragon_limit_up_analysis"
+    try:
+        df = _cached_call(func_name, _build_limit_up_analysis, date_str=date)
+        _record_stat(func_name, (time.time() - start) * 1000)
+        return _degraded_df_to_response(
+            df,
+            source="zt_pool_em",
+            is_realtime=True,
+            data_timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            degraded=False,
+            fallback_level="none",
+            schema_version="dragon-v1",
+        )
+    except Exception as e:
+        _record_stat(func_name, (time.time() - start) * 1000, is_error=True)
+        logger.error("dragon_limit_up_analysis failed", date=date, error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/dragon/opening-snapshot")
+async def dragon_opening_snapshot(
+    symbol: str = Query(..., description="股票代码，如 600519"),
+):
+    """龙头战法专用：竞价/开盘后15分钟快照。"""
+    start = time.time()
+    func_name = "dragon_opening_snapshot"
+    normalized_symbol = _normalize_stock_code(symbol)
+    try:
+        spot_df = _multi_source_call(
+            sources=[
+                ("eastmoney-full", _fetch_full_a_spot_direct_em, {}),
+                ("eastmoney-akshare", ak.stock_zh_a_spot_em, {}),
+                ("tencent", _fetch_full_a_spot_tencent, {}),
+            ],
+            cache_name="stock_zh_a_spot_full",
+            cache_ttl=60,
+        )
+        spot_df = _normalize_spot_df(spot_df)
+        stock_row = spot_df[spot_df["代码"] == normalized_symbol].head(1) if not spot_df.empty and "代码" in spot_df.columns else pd.DataFrame()
+        minute_df = _cached_call("dragon_minute_bars", _fetch_minute_bars, symbol=normalized_symbol, period="1")
+
+        if stock_row.empty:
+            df = pd.DataFrame([{
+                "stock_code": normalized_symbol,
+                "open_pct": None,
+                "current_price": None,
+                "change_pct": None,
+                "auction_strength": None,
+                "first_5m_return": None,
+                "first_10m_return": None,
+                "first_15m_return": None,
+                "pullback_from_high_15m": None,
+                "data_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }])
+            return _degraded_df_to_response(
+                df,
+                source="opening-snapshot",
+                is_realtime=True,
+                data_timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                degraded=True,
+                fallback_level="spot-miss",
+                schema_version="dragon-v1",
+            )
+
+        row = stock_row.iloc[0]
+        open_price = pd.to_numeric(row.get("今开"), errors="coerce")
+        pre_close = pd.to_numeric(row.get("昨收"), errors="coerce")
+        current_price = pd.to_numeric(row.get("最新价"), errors="coerce")
+        change_pct = pd.to_numeric(row.get("涨跌幅"), errors="coerce")
+
+        open_pct = None
+        if pd.notna(open_price) and pd.notna(pre_close) and pre_close:
+            open_pct = round((float(open_price) - float(pre_close)) / float(pre_close) * 100, 2)
+
+        first_5m_return = None
+        first_10m_return = None
+        first_15m_return = None
+        pullback_from_high_15m = None
+        auction_strength = None
+
+        if minute_df is not None and not minute_df.empty:
+            closes = minute_df["close"].dropna().tolist()
+            highs = minute_df["high"].dropna().tolist()
+            if open_pct is not None and len(closes) >= 1 and open_price:
+                first_5m_idx = min(len(closes), 5) - 1
+                first_10m_idx = min(len(closes), 10) - 1
+                first_15m_idx = min(len(closes), 15) - 1
+                first_5m_return = round((float(closes[first_5m_idx]) - float(open_price)) / float(open_price) * 100, 2)
+                first_10m_return = round((float(closes[first_10m_idx]) - float(open_price)) / float(open_price) * 100, 2)
+                first_15m_return = round((float(closes[first_15m_idx]) - float(open_price)) / float(open_price) * 100, 2)
+                high_15m = float(max(highs[:first_15m_idx + 1])) if highs else float(open_price)
+                close_15m = float(closes[first_15m_idx])
+                if high_15m:
+                    pullback_from_high_15m = round((high_15m - close_15m) / high_15m * 100, 2)
+                auction_strength = round((first_15m_return or 0) - (open_pct or 0), 2)
+
+        df = pd.DataFrame([{
+            "stock_code": normalized_symbol,
+            "stock_name": row.get("名称"),
+            "open_pct": open_pct,
+            "current_price": float(current_price) if pd.notna(current_price) else None,
+            "change_pct": float(change_pct) if pd.notna(change_pct) else None,
+            "auction_strength": auction_strength,
+            "first_5m_return": first_5m_return,
+            "first_10m_return": first_10m_return,
+            "first_15m_return": first_15m_return,
+            "pullback_from_high_15m": pullback_from_high_15m,
+            "data_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }])
+        _record_stat(func_name, (time.time() - start) * 1000)
+        return _degraded_df_to_response(
+            df,
+            source="spot+minute",
+            is_realtime=True,
+            data_timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            degraded=False,
+            fallback_level="none",
+            schema_version="dragon-v1",
+        )
+    except Exception as e:
+        _record_stat(func_name, (time.time() - start) * 1000, is_error=True)
+        logger.error("dragon_opening_snapshot failed", symbol=normalized_symbol, error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 

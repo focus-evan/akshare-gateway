@@ -86,6 +86,15 @@ python app.py
 | `/api/stock/zt_pool_em` | date | 2min | 涨停股池 |
 | `/api/stock/zt_pool_dtgc_em` | date | 2min | 跌停股池 |
 
+### 龙头战法专用接口
+
+| 接口 | 参数 | 缓存TTL | 说明 |
+|------|------|---------|------|
+| `/api/dragon/minute-bars` | symbol,period | 2min | 龙头战法分钟级K线，统一输出 datetime/open/high/low/close/volume/amount |
+| `/api/dragon/stock-themes` | symbol | 10min | 反查个股所属题材列表，避免业务层错误调用概念成份接口 |
+| `/api/dragon/limit-up-analysis` | date | 2min | 标准化涨停结构，包含连板数、首封时间、封单、题材列表等 |
+| `/api/dragon/opening-snapshot` | symbol | 60s | 竞价/开盘后15分钟快照，输出高开幅度、前5/10/15分钟收益、回撤等 |
+
 ### 快讯 & 其他
 
 | 接口 | 参数 | 缓存TTL | 说明 |
@@ -149,10 +158,13 @@ python test_gateway.py http://your-server:9898
 | 数据类型 | TTL | 说明 |
 |---------|-----|------|
 | 实时行情 | 60s | 交易时间内频繁变化 |
+| 龙头开盘快照 | 60s | 竞价/前15分钟快速更新 |
 | 涨跌停池 | 2min | 盘中实时更新 |
+| 龙头分钟线 | 2min | 分钟级K线供弱转强/承接分析 |
 | 资金流向 | 3min | 中等频率变化 |
 | 个股指标 | 5min | PE/PB分位不常变 |
 | 板块列表 | 10min | 很少变化 |
+| 个股题材映射 | 10min | 通过概念成份反查股票题材 |
 | 代码名称 | 1h | 极少变化 |
 
 > 可通过 `POST /cache/clear` 手动清除缓存

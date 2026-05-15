@@ -467,6 +467,21 @@ def test_gateway_api(base_url: str, fast: bool = False) -> List[Dict]:
         ("A股实时行情",
          "/api/stock/zh_a_spot_em", {}, 3000, False),
 
+        ("龙头分钟线-600519",
+         "/api/dragon/minute-bars",
+         {"symbol": "600519", "period": "1"}, 1, True),
+
+        ("龙头题材映射-600519",
+         "/api/dragon/stock-themes",
+         {"symbol": "600519"}, 0, True),
+
+        ("龙头涨停结构",
+         "/api/dragon/limit-up-analysis", {"date": trade_date}, 1, True),
+
+        ("龙头开盘快照-600519",
+         "/api/dragon/opening-snapshot",
+         {"symbol": "600519"}, 1, True),
+
         ("个股K线-600519",
          "/api/stock/zh_a_hist",
          {"symbol": "600519", "period": "daily",
