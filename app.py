@@ -668,6 +668,35 @@ def _fetch_minute_bars(symbol: str, period: str) -> pd.DataFrame:
             logger.warning("Minute bars source failed", symbol=code, period=period, func=getattr(func, "__name__", "unknown"), error=str(e)[:160])
             continue
 
+    # 兜底：如果分钟线全部失败，用日K最后一根构造一个退化结果，避免接口空返回影响下游
+    try:
+        hist = _multi_source_call(
+            sources=[
+                ("sina", _sina_stock_hist, {"symbol": code, "start_date": _latest_trade_date_str(), "end_date": _latest_trade_date_str(), "adjust": "qfq"}),
+                ("tencent", _tencent_kline, {"symbol": code, "start_date": _latest_trade_date_str(), "end_date": _latest_trade_date_str(), "adjust": "qfq"}),
+                ("eastmoney", ak.stock_zh_a_hist, {"symbol": code, "period": "daily", "start_date": _latest_trade_date_str(), "end_date": _latest_trade_date_str(), "adjust": "qfq"}),
+            ],
+            cache_name=f"dragon_minute_bars_fallback:{code}",
+            cache_ttl=300,
+        )
+        hist = _normalize_hist_date_column(hist)
+        if hist is not None and not hist.empty:
+            row = hist.iloc[-1]
+            date_val = str(row.get("日期", row.get("date", _latest_trade_date_iso())))
+            frame = pd.DataFrame([{
+                "datetime": f"{date_val} 15:00:00",
+                "open": float(row.get("开盘", row.get("open", 0)) or 0),
+                "high": float(row.get("最高", row.get("high", 0)) or 0),
+                "low": float(row.get("最低", row.get("low", 0)) or 0),
+                "close": float(row.get("收盘", row.get("close", 0)) or 0),
+                "volume": float(row.get("成交量", row.get("volume", 0)) or 0),
+                "amount": float(row.get("成交额", row.get("amount", 0)) or 0),
+            }])
+            logger.warning("Minute bars fallback to daily close", symbol=code, period=period)
+            return _normalize_minute_bars_df(frame)
+    except Exception as e:
+        logger.warning("Minute bars daily fallback failed", symbol=code, period=period, error=str(e)[:160])
+
     return pd.DataFrame()
 
 
@@ -2432,6 +2461,28 @@ async def stock_individual_info_em(
 #  北向资金持仓
 # =====================================================================
 
+def _fetch_northbound_hold_fallback(market: str = "北向", indicator: str = "月排行") -> pd.DataFrame:
+    """北向持仓兜底：尝试不同 indicator，全部失败则返回空表而不是抛 500。"""
+    candidate_indicators = []
+    if indicator:
+        candidate_indicators.append(indicator)
+    for alt in ["月排行", "季排行", "年排行", "今日排行"]:
+        if alt not in candidate_indicators:
+            candidate_indicators.append(alt)
+
+    for idx_name in candidate_indicators:
+        try:
+            df = _cached_call("stock_hsgt_hold_stock_em", ak.stock_hsgt_hold_stock_em,
+                              market=market, indicator=idx_name)
+            if df is not None and not df.empty:
+                logger.info("Northbound fallback success", market=market, indicator=idx_name, rows=len(df))
+                return df
+        except Exception as e:
+            logger.warning("Northbound fallback failed", market=market, indicator=idx_name, error=str(e)[:160])
+            continue
+    return pd.DataFrame()
+
+
 @app.get("/api/stock/hsgt_hold_stock_em")
 async def stock_hsgt_hold_stock_em(
     market: str = Query("北向", description="市场: 北向/沪股通/深股通"),
@@ -2441,7 +2492,7 @@ async def stock_hsgt_hold_stock_em(
     获取北向/沪深通持仓排名
 
     对应 akshare: ak.stock_hsgt_hold_stock_em(market, indicator)
-    非交易日自动回退到最近交易日可用排行类型，避免接口空结构报错。
+    非交易日或结构异常时，降级为最近可用排行，至少返回空表而非 500。
     """
     start = time.time()
     func_name = "stock_hsgt_hold_stock_em"
@@ -2450,28 +2501,13 @@ async def stock_hsgt_hold_stock_em(
         if not _is_trading_day_now() and indicator == "今日排行":
             query_indicator = "月排行"
 
-        df = _cached_call(func_name, ak.stock_hsgt_hold_stock_em,
-                          market=market, indicator=query_indicator)
-        if df is None or df.empty:
-            if indicator != query_indicator:
-                logger.warning("北向持仓非交易日回退后仍为空", market=market, indicator=query_indicator)
-            _record_stat(func_name, (time.time() - start) * 1000)
-            return _df_to_response(pd.DataFrame())
-
+        df = _fetch_northbound_hold_fallback(market=market, indicator=query_indicator)
         _record_stat(func_name, (time.time() - start) * 1000)
         return _df_to_response(df)
     except Exception as e:
-        if not _is_trading_day_now() and indicator == "今日排行":
-            try:
-                df = _cached_call(func_name, ak.stock_hsgt_hold_stock_em,
-                                  market=market, indicator="月排行")
-                _record_stat(func_name, (time.time() - start) * 1000)
-                return _df_to_response(df)
-            except Exception:
-                pass
         _record_stat(func_name, (time.time() - start) * 1000, is_error=True)
         logger.error("stock_hsgt_hold_stock_em failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        return _df_to_response(pd.DataFrame())
 
 
 @app.get("/api/index/global_spot_em")
