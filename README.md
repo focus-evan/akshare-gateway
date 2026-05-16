@@ -79,11 +79,11 @@ python app.py
 
 | 接口 | 参数 | 缓存TTL | 说明 |
 |------|------|---------|------|
-| `/api/stock/board_concept_name_em` | 无 | 10min | 东财概念板块列表 |
-| `/api/stock/board_concept_cons_em` | symbol | 10min | 东财概念板块成份股 |
+| `/api/stock/board_concept_name_em` | 无 | 10min | 东财概念板块列表（失败时优先回退同花顺） |
+| `/api/stock/board_concept_cons_em` | symbol | 10min | 东财概念板块成份股（失败时优先回退直连东财/同花顺） |
 | `/api/stock/board_concept_name_ths` | 无 | 10min | 同花顺概念板块列表 |
 | `/api/stock/board_concept_cons_ths` | symbol | 10min | 同花顺概念板块成份股 |
-| `/api/stock/zt_pool_em` | date | 2min | 涨停股池 |
+| `/api/stock/zt_pool_em` | date | 2min | 涨停股池（非交易日建议传最近交易日） |
 | `/api/stock/zt_pool_dtgc_em` | date | 2min | 跌停股池 |
 
 ### 龙头战法专用接口
@@ -152,6 +152,9 @@ python test_gateway.py
 # 测试远程
 python test_gateway.py http://your-server:9898
 ```
+
+> 测试脚本已区分“交易日敏感接口”和“非交易日也应稳定接口”。
+> 周末/节假日运行时，A股实时行情、北向持仓、资金流排名、涨停池等接口失败或返回空，可能是休市带来的自然放大，不一定代表代码故障；历史K线、代码表、财联社快讯、同花顺概念板块等接口则应尽量稳定。
 
 ## 缓存策略
 

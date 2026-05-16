@@ -63,6 +63,10 @@ def _section(title: str):
     print(f"{'=' * 60}{RESET}\n")
 
 
+def _is_trade_day() -> bool:
+    return datetime.now().weekday() < 5
+
+
 # =====================================================================
 #  直连测试（直接调 akshare）
 # =====================================================================
@@ -90,65 +94,65 @@ def test_direct_akshare(fast: bool = False) -> List[Dict]:
 
     hist_start = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
 
-    # 测试用例：(名称, 函数, 参数, 预期最少行数, 是否慢接口)
-    test_cases: List[Tuple[str, str, dict, int, bool]] = [
+    # 测试用例：(名称, 函数, 参数, 预期最少行数, 是否慢接口, 是否交易日敏感)
+    test_cases: List[Tuple[str, str, dict, int, bool, bool]] = [
         # ---- 核心高频接口 ----
         ("A股实时行情 (stock_zh_a_spot_em)",
-         "stock_zh_a_spot_em", {}, 3000, False),
+         "stock_zh_a_spot_em", {}, 3000, False, True),
 
         ("个股历史K线 (stock_zh_a_hist) - 600519",
          "stock_zh_a_hist",
          {"symbol": "600519", "period": "daily",
-          "start_date": hist_start, "end_date": today, "adjust": "qfq"},
-         10, False),
+          "start_date": hist_start, "end_date": trade_date, "adjust": "qfq"},
+         10, False, False),
 
         ("A股代码名称 (stock_info_a_code_name)",
-         "stock_info_a_code_name", {}, 3000, False),
+         "stock_info_a_code_name", {}, 3000, False, False),
 
         # ---- 北向资金 ----
         ("北向持仓排名 (stock_hsgt_hold_stock_em)",
          "stock_hsgt_hold_stock_em",
-         {"market": "北向", "indicator": "今日排行"}, 10, False),
+         {"market": "北向", "indicator": "今日排行"}, 10, False, True),
 
         # ---- 资金流向 ----
         ("个股资金流排名 (stock_individual_fund_flow_rank)",
          "stock_individual_fund_flow_rank",
-         {"indicator": "今日"}, 100, False),
+         {"indicator": "今日"}, 100, False, True),
 
         # ---- 涨跌停 ----
         ("涨停股池 (stock_zt_pool_em)",
-         "stock_zt_pool_em", {"date": trade_date}, 1, False),
+         "stock_zt_pool_em", {"date": trade_date}, 1, False, True),
 
         # ---- 概念板块 ----
         ("东财概念板块 (board_concept_name_em)",
-         "stock_board_concept_name_em", {}, 100, False),
+         "stock_board_concept_name_em", {}, 100, False, False),
 
         # ---- 港股行情（慢接口）----
         ("港股实时行情 (stock_hk_spot_em)",
-         "stock_hk_spot_em", {}, 1000, True),
+         "stock_hk_spot_em", {}, 1000, True, True),
 
         # ---- 估值指标（慢接口）----
         ("个股估值指标 (stock_a_indicator_lg) - 600519",
-         "stock_a_indicator_lg", {"symbol": "600519"}, 100, True),
+         "stock_a_indicator_lg", {"symbol": "600519"}, 100, True, False),
 
         # ---- 个股详情 ----
         ("个股详情 (stock_individual_info_em) - 600519",
-         "stock_individual_info_em", {"symbol": "600519"}, 1, False),
+         "stock_individual_info_em", {"symbol": "600519"}, 1, False, False),
 
         # ---- 概念板块成份 ----
         ("概念板块成份 (board_concept_cons_em) - 人工智能",
-         "stock_board_concept_cons_em", {"symbol": "人工智能"}, 10, True),
+         "stock_board_concept_cons_em", {"symbol": "人工智能"}, 10, True, False),
 
         # ---- 新闻快讯 ----
         ("财经快讯-东财 (stock_info_global_em)",
-         "stock_info_global_em", {}, 5, False),
+         "stock_info_global_em", {}, 5, False, False),
 
         ("财经快讯-财联社 (stock_info_global_cls)",
-         "stock_info_global_cls", {}, 5, True),
+         "stock_info_global_cls", {}, 5, True, False),
 
         # ---- 同花顺 ----
         ("同花顺概念板块 (board_concept_name_ths)",
-         "stock_board_concept_name_ths", {}, 100, True),
+         "stock_board_concept_name_ths", {}, 100, True, False),
     ]
 
     results = []
@@ -156,7 +160,7 @@ def test_direct_akshare(fast: bool = False) -> List[Dict]:
     failed = 0
     skipped = 0
 
-    for name, func_name, kwargs, min_rows, is_slow in test_cases:
+    for name, func_name, kwargs, min_rows, is_slow, trading_day_sensitive in test_cases:
         if fast and is_slow:
             _warn(f"{name} — 跳过（快速模式）")
             skipped += 1
@@ -181,14 +185,17 @@ def test_direct_akshare(fast: bool = False) -> List[Dict]:
                                 "rows": rows, "time": round(elapsed, 1)})
                 passed += 1  # 有数据算通过
             else:
+                label = "交易日敏感接口，非交易日返回空不一定代表故障" if trading_day_sensitive and not _is_trade_day() else "empty result"
                 _fail(f"{name}  —  返回空  ({elapsed:.1f}s)")
                 results.append({"name": name, "status": "FAIL",
-                                "error": "empty result", "time": round(elapsed, 1)})
+                                "error": label, "time": round(elapsed, 1)})
                 failed += 1
 
         except Exception as e:
             elapsed = time.time() - start
             err_msg = str(e)[:120]
+            if trading_day_sensitive and not _is_trade_day():
+                err_msg = f"{err_msg} [非交易日敏感接口]"
             _fail(f"{name}  —  {err_msg}  ({elapsed:.1f}s)")
             results.append({"name": name, "status": "FAIL",
                             "error": err_msg, "time": round(elapsed, 1)})
@@ -200,6 +207,8 @@ def test_direct_akshare(fast: bool = False) -> List[Dict]:
     print(f"\n  📊 直连总结：{GREEN}{passed} 通过{RESET} / "
           f"{RED}{failed} 失败{RESET} / "
           f"{YELLOW}{skipped} 跳过{RESET}")
+    if not _is_trade_day():
+        print(f"  {YELLOW}提示：当前为非交易日，实时行情/北向/资金流/涨停池类接口失败或空数据可能放大，不完全代表代码故障。{RESET}")
 
     return results
 

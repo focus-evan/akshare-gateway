@@ -256,7 +256,42 @@ class TTLCache:
         }
 
 
-cache = TTLCache()
+def _is_trading_day_now() -> bool:
+    """简化版交易日判断：周一至周五。"""
+    return datetime.now().weekday() < 5
+
+
+def _latest_trade_date_str() -> str:
+    """获取最近交易日 YYYYMMDD（简化版：周末回退到上周五）。"""
+    now = datetime.now()
+    if now.weekday() == 5:
+        now = now - timedelta(days=1)
+    elif now.weekday() == 6:
+        now = now - timedelta(days=2)
+    return now.strftime("%Y%m%d")
+
+
+def _latest_trade_date_iso() -> str:
+    """获取最近交易日 YYYY-MM-DD。"""
+    dt = datetime.strptime(_latest_trade_date_str(), "%Y%m%d")
+    return dt.strftime("%Y-%m-%d")
+
+
+def _normalize_hist_date_column(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    frame = df.copy()
+    date_col = None
+    for col in frame.columns:
+        col_str = str(col)
+        if col_str in ("日期", "date"):
+            date_col = col
+            break
+    if date_col:
+        frame[date_col] = frame[date_col].astype(str).str.replace("/", "-")
+    return frame
+
+
 
 # 缓存 TTL 配置（秒）
 CACHE_TTL = {
@@ -2205,6 +2240,7 @@ async def stock_zh_a_hist(
             ],
             cache_name=f"{func_name}:{symbol}:{period}:{adjust}",
         )
+        df = _normalize_hist_date_column(df)
         _record_stat(func_name, (time.time() - start) * 1000)
         return _df_to_response(df)
     except Exception as e:
@@ -2402,15 +2438,34 @@ async def stock_hsgt_hold_stock_em(
     获取北向/沪深通持仓排名
 
     对应 akshare: ak.stock_hsgt_hold_stock_em(market, indicator)
+    非交易日自动回退到最近交易日可用排行类型，避免接口空结构报错。
     """
     start = time.time()
     func_name = "stock_hsgt_hold_stock_em"
     try:
+        query_indicator = indicator
+        if not _is_trading_day_now() and indicator == "今日排行":
+            query_indicator = "月排行"
+
         df = _cached_call(func_name, ak.stock_hsgt_hold_stock_em,
-                          market=market, indicator=indicator)
+                          market=market, indicator=query_indicator)
+        if df is None or df.empty:
+            if indicator != query_indicator:
+                logger.warning("北向持仓非交易日回退后仍为空", market=market, indicator=query_indicator)
+            _record_stat(func_name, (time.time() - start) * 1000)
+            return _df_to_response(pd.DataFrame())
+
         _record_stat(func_name, (time.time() - start) * 1000)
         return _df_to_response(df)
     except Exception as e:
+        if not _is_trading_day_now() and indicator == "今日排行":
+            try:
+                df = _cached_call(func_name, ak.stock_hsgt_hold_stock_em,
+                                  market=market, indicator="月排行")
+                _record_stat(func_name, (time.time() - start) * 1000)
+                return _df_to_response(df)
+            except Exception:
+                pass
         _record_stat(func_name, (time.time() - start) * 1000, is_error=True)
         logger.error("stock_hsgt_hold_stock_em failed", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
