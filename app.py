@@ -25,7 +25,7 @@ import time
 import traceback
 import threading
 from collections import defaultdict
-from datetime import datetime, date as date_type, time as time_type
+from datetime import datetime, timedelta, date as date_type, time as time_type
 from typing import Any, Dict, List, Optional
 
 import akshare as ak
@@ -254,6 +254,9 @@ class TTLCache:
             "misses": self._misses,
             "hit_rate": f"{self._hits / total * 100:.1f}%" if total > 0 else "N/A",
         }
+
+
+cache = TTLCache()
 
 
 def _is_trading_day_now() -> bool:
@@ -1492,7 +1495,6 @@ def _fetch_concept_cons_direct_em(symbol: str) -> pd.DataFrame:
             if not board_code:
                 logger.warning("Concept board code not found on domain",
                                domain=domain, symbol=symbol)
-                session.close()
                 continue
 
             # 第二步：用板块代码获取成份股
