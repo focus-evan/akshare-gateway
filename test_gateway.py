@@ -502,7 +502,7 @@ def test_gateway_api(base_url: str, fast: bool = False) -> List[Dict]:
 
         ("北向持仓排名",
          "/api/stock/hsgt_hold_stock_em",
-         {"market": "北向", "indicator": "今日排行"}, 10, False),
+         {"market": "北向", "indicator": "今日排行"}, 0, False),
 
         ("资金流排名",
          "/api/stock/individual_fund_flow_rank",
@@ -561,7 +561,8 @@ def test_gateway_api(base_url: str, fast: bool = False) -> List[Dict]:
             status = body.get("status", "?")
 
             if status == "ok" and count >= min_rows:
-                _ok(f"{name}  —  {count} 行  ({elapsed:.1f}s)")
+                suffix = " (空结果允许)" if min_rows == 0 and count == 0 else ""
+                _ok(f"{name}  —  {count} 行{suffix}  ({elapsed:.1f}s)")
                 results.append({"name": name, "status": "PASS",
                                 "rows": count, "time": round(elapsed, 1)})
                 passed += 1

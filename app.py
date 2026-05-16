@@ -2496,11 +2496,11 @@ async def stock_hsgt_hold_stock_em(
     """
     start = time.time()
     func_name = "stock_hsgt_hold_stock_em"
-    try:
-        query_indicator = indicator
-        if not _is_trading_day_now() and indicator == "今日排行":
-            query_indicator = "月排行"
+    query_indicator = indicator
+    if not _is_trading_day_now() and indicator == "今日排行":
+        query_indicator = "月排行"
 
+    try:
         df = _fetch_northbound_hold_fallback(market=market, indicator=query_indicator)
         _record_stat(func_name, (time.time() - start) * 1000)
         return _df_to_response(df)
