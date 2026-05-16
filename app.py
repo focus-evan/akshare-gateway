@@ -1696,8 +1696,9 @@ async def stock_zh_a_spot_em():
     try:
         df = _multi_source_call(
             sources=[
-                ("eastmoney", ak.stock_zh_a_spot_em, {}),
+                ("tencent", _fetch_full_a_spot_tencent, {}),
                 ("sina", _sina_a_spot, {}),
+                ("eastmoney", ak.stock_zh_a_spot_em, {}),
             ],
             cache_name=func_name,
         )
@@ -2236,9 +2237,9 @@ async def stock_zh_a_hist(
 
         df = _multi_source_call(
             sources=[
-                ("eastmoney", ak.stock_zh_a_hist, em_kwargs),
                 ("sina", _sina_stock_hist, sina_kwargs),
                 ("tencent", _tencent_kline, tencent_kwargs),
+                ("eastmoney", ak.stock_zh_a_hist, em_kwargs),
             ],
             cache_name=f"{func_name}:{symbol}:{period}:{adjust}",
         )
@@ -2412,10 +2413,10 @@ async def stock_individual_info_em(
     try:
         df = _multi_source_call(
             sources=[
-                ("eastmoney", ak.stock_individual_info_em, {"symbol": symbol}),
                 ("sina_vip", _fetch_stock_detail_vip_sina, {"symbol": symbol}),
                 ("tencent", _fetch_stock_detail_tencent, {"symbol": symbol}),
                 ("sina_sinajs", _fetch_stock_detail_sina, {"symbol": symbol}),
+                ("eastmoney", ak.stock_individual_info_em, {"symbol": symbol}),
             ],
             cache_name=f"{func_name}:{symbol}",
         )
@@ -2710,8 +2711,8 @@ async def stock_board_concept_name_em():
     try:
         df = _multi_source_call(
             sources=[
-                ("eastmoney", ak.stock_board_concept_name_em, {}),
                 ("ths", ak.stock_board_concept_name_ths, {}),
+                ("eastmoney", ak.stock_board_concept_name_em, {}),
             ],
             cache_name=func_name,
         )

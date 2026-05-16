@@ -57,10 +57,10 @@ python app.py
 
 | 接口 | 参数 | 缓存TTL | 说明 |
 |------|------|---------|------|
-| `/api/stock/zh_a_spot_em` | 无 | 60s | A股全市场实时行情 |
-| `/api/stock/zh_a_hist` | symbol,period,start_date,end_date,adjust | 5min | 个股历史K线 |
+| `/api/stock/zh_a_spot_em` | 无 | 60s | A股全市场实时行情（优先腾讯全量/新浪，东财兜底） |
+| `/api/stock/zh_a_hist` | symbol,period,start_date,end_date,adjust | 5min | 个股历史K线（优先新浪K线，其次腾讯，东财兜底） |
 | `/api/stock/a_indicator_lg` | symbol | 5min | PE/PB历史估值指标 |
-| `/api/stock/individual_info_em` | symbol | 5min | 个股详细信息 |
+| `/api/stock/individual_info_em` | symbol | 5min | 个股详细信息（优先新浪VIP/腾讯，东财兜底） |
 
 ### 港股行情
 
@@ -72,8 +72,8 @@ python app.py
 
 | 接口 | 参数 | 缓存TTL | 说明 |
 |------|------|---------|------|
-| `/api/stock/hsgt_hold_stock_em` | market,indicator | 3min | 北向资金持仓排名 |
-| `/api/stock/individual_fund_flow_rank` | indicator | 3min | 个股资金流向排名 |
+| `/api/stock/hsgt_hold_stock_em` | market,indicator | 3min | 北向资金持仓排名（非交易日自动回退月排行） |
+| `/api/stock/individual_fund_flow_rank` | indicator | 3min | 个股资金流向排名（直连东财失败时回退新浪） |
 
 ### 板块 & 涨跌停
 
