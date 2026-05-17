@@ -3148,6 +3148,22 @@ async def _generic_fund_flow_call(func_name: str, params: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/stock/fund_flow_industry")
+async def stock_fund_flow_industry(
+    symbol: str = Query("即时", description="时间维度: 即时/3日排行/5日排行/10日排行/20日排行"),
+):
+    """获取行业板块资金流向。"""
+    return await _generic_fund_flow_call("stock_fund_flow_industry", {"symbol": symbol})
+
+
+@app.get("/api/stock/fund_flow_concept")
+async def stock_fund_flow_concept(
+    symbol: str = Query("即时", description="时间维度: 即时/3日排行/5日排行/10日排行/20日排行"),
+):
+    """获取概念板块资金流向。"""
+    return await _generic_fund_flow_call("stock_fund_flow_concept", {"symbol": symbol})
+
+
 @app.get("/api/akshare/{func_name}")
 async def generic_akshare_proxy(func_name: str, request: Request):
     """

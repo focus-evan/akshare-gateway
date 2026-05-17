@@ -74,6 +74,8 @@ python app.py
 |------|------|---------|------|
 | `/api/stock/hsgt_hold_stock_em` | market,indicator | 3min | 北向资金持仓排名（非交易日自动回退月排行） |
 | `/api/stock/individual_fund_flow_rank` | indicator | 3min | 个股资金流向排名（直连东财失败时回退新浪） |
+| `/api/stock/fund_flow_industry` | symbol | 3min | 行业板块资金流向（供 ai-stock 的 sector_capital_flow 优先调用） |
+| `/api/stock/fund_flow_concept` | symbol | 3min | 概念板块资金流向（行业板块失败时的备选） |
 
 ### 板块 & 涨跌停
 
