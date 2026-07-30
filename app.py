@@ -41,6 +41,7 @@ from analysis_bundle import (
     normalize_tencent_kline_date,
     parse_tencent_quote_payload,
 )
+from cffex_risk_inputs import fetch_cffex_risk_inputs
 
 structlog.configure(
     processors=[
@@ -2779,6 +2780,38 @@ async def index_global_spot_em():
         _record_stat(func_name, (time.time() - start) * 1000, is_error=True)
         logger.error("index_global_spot_em failed", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/futures/cffex-risk-inputs")
+async def cffex_risk_inputs(
+    date: str = Query("", description="截止日期 YYYYMMDD，默认当天"),
+    broker: str = Query("中信期货", description="期货公司结算会员简称"),
+    lookback_sessions: int = Query(5, ge=1, le=10, description="最近交易日数量"),
+):
+    """中金所股指期货会员披露、合约行情及可选现货指数收盘价。"""
+    target_date = date or datetime.now().strftime("%Y%m%d")
+    try:
+        data = await asyncio.to_thread(
+            fetch_cffex_risk_inputs,
+            ak,
+            target_date=target_date,
+            broker=broker,
+            lookback_sessions=lookback_sessions,
+        )
+        return JSONResponse(
+            content={"status": "ok", "data": _safe_serialize(data)}
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"无效日期: {exc}")
+    except Exception as exc:
+        logger.error(
+            "CFFEX risk inputs failed",
+            date=target_date,
+            broker=broker,
+            error=str(exc),
+            trace=traceback.format_exc(),
+        )
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 # =====================================================================
