@@ -26,8 +26,8 @@ set -e
 
 # ==================== 配置区 ====================
 
-# 项目 Git 仓库
-GIT_REPO="git@github.com:focus-evan/akshare-gateway.git"
+# 项目 Git 仓库（当前网络屏蔽 GitHub SSH 22，固定走官方 SSH 443）
+GIT_REPO="ssh://git@ssh.github.com:443/focus-evan/akshare-gateway.git"
 GIT_BRANCH="main"
 
 # 部署目录
@@ -178,6 +178,8 @@ deploy_project() {
     if [ -d "${DEPLOY_DIR}/.git" ]; then
         log_info "项目已存在，拉取最新代码..."
         cd "${DEPLOY_DIR}"
+        # 兼容旧部署：原 origin 使用 github.com:22，会在当前网络中超时。
+        git remote set-url origin "${GIT_REPO}"
         git fetch origin
         git reset --hard "origin/${GIT_BRANCH}"
         git pull origin "${GIT_BRANCH}"
