@@ -122,6 +122,8 @@ def test_direct_akshare(fast: bool = False) -> List[Dict]:
         # ---- 涨跌停 ----
         ("涨停股池 (stock_zt_pool_em)",
          "stock_zt_pool_em", {"date": trade_date}, 1, False, True),
+        ("炸板股池 (stock_zt_pool_zbgc_em)",
+         "stock_zt_pool_zbgc_em", {"date": trade_date}, 0, False, True),
 
         # ---- 概念板块 ----
         ("东财概念板块 (board_concept_name_em)",

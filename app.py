@@ -323,6 +323,7 @@ CACHE_TTL = {
     # 涨停/跌停池 — 2分钟
     "stock_zt_pool_em": 120,
     "stock_zt_pool_dtgc_em": 120,
+    "stock_zt_pool_zbgc_em": 120,
     "dragon_limit_up_analysis": 120,
     # 北向资金 — 3分钟
     "stock_hsgt_hold_stock_em": 180,
@@ -2900,6 +2901,23 @@ async def stock_zt_pool_dtgc_em(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/stock/zt_pool_zbgc_em")
+async def stock_zt_pool_zbgc_em(
+    date: str = Query(..., description="日期 YYYYMMDD"),
+):
+    """获取炸板股池，用于计算真实炸板率。"""
+    start = time.time()
+    func_name = "stock_zt_pool_zbgc_em"
+    try:
+        df = _cached_call(func_name, ak.stock_zt_pool_zbgc_em, date=date)
+        _record_stat(func_name, (time.time() - start) * 1000)
+        return _df_to_response(df)
+    except Exception as e:
+        _record_stat(func_name, (time.time() - start) * 1000, is_error=True)
+        logger.error("stock_zt_pool_zbgc_em failed", date=date, error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # =====================================================================
 #  概念板块
 # =====================================================================
@@ -3371,6 +3389,8 @@ async def generic_akshare_proxy(func_name: str, request: Request):
         "stock_zt_pool_em": lambda p: stock_zt_pool_em(
             date=p.get("date", "")),
         "stock_zt_pool_dtgc_em": lambda p: stock_zt_pool_dtgc_em(
+            date=p.get("date", "")),
+        "stock_zt_pool_zbgc_em": lambda p: stock_zt_pool_zbgc_em(
             date=p.get("date", "")),
         "stock_board_concept_name_em": lambda p: stock_board_concept_name_em(),
         "stock_board_concept_cons_em": lambda p: stock_board_concept_cons_em(
