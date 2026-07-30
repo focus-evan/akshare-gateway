@@ -15,6 +15,7 @@ AKShare Gateway — 统一第三方数据接口网关平台 v3.0
 所有接口返回 JSON 格式: {"status":"ok","count":N,"data":[...]}
 """
 
+import asyncio
 import hashlib
 import json
 import math
@@ -35,6 +36,11 @@ import structlog
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse, Response
+
+from analysis_bundle import (
+    normalize_tencent_kline_date,
+    parse_tencent_quote_payload,
+)
 
 structlog.configure(
     processors=[
@@ -305,6 +311,8 @@ CACHE_TTL = {
     "stock_zh_a_spot_full": 60,
     # 个股历史K线 — 5分钟
     "stock_zh_a_hist": 300,
+    "stock_analysis_bundle": 30,
+    "stock_single_quote": 15,
     "dragon_minute_bars": 120,
     # 个股指标 — 5分钟（PE/PB分位不常变）
     "stock_a_indicator_lg": 300,
@@ -1240,6 +1248,8 @@ def _tencent_kline(symbol: str, start_date: str = "",
 
     prefix = "sz" if symbol.startswith(('0', '3')) else "sh"
     fq = kwargs.get("adjust", "qfq")
+    start_date = normalize_tencent_kline_date(start_date)
+    end_date = normalize_tencent_kline_date(end_date)
 
     url = (
         f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
@@ -1406,6 +1416,30 @@ def _fetch_stock_detail_tencent(symbol: str) -> pd.DataFrame:
     except Exception as e:
         logger.warning("Tencent stock detail failed", symbol=symbol, error=str(e))
     return pd.DataFrame()
+
+
+def _fetch_single_quote_tencent(symbol: str) -> Dict[str, Any]:
+    """Fetch one A-share quote directly, avoiding a full-market snapshot."""
+    cache_key = _cache_key("stock_single_quote", symbol=symbol)
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    headers = _build_browser_headers()
+    headers["Referer"] = "https://stockapp.finance.qq.com/"
+    prefix = "sz" if symbol.startswith(("0", "3")) else "sh"
+    response = requests.get(
+        f"https://qt.gtimg.cn/q={prefix}{symbol}",
+        headers=headers,
+        timeout=5,
+    )
+    response.raise_for_status()
+    response.encoding = "gbk"
+    quote = parse_tencent_quote_payload(response.text, symbol)
+    if not quote:
+        raise ValueError(f"Tencent returned an invalid quote for {symbol}")
+    cache.set(cache_key, quote, CACHE_TTL["stock_single_quote"])
+    return quote
 
 
 def _fetch_fund_flow_rank_direct(indicator: str = "今日") -> pd.DataFrame:
@@ -2270,7 +2304,11 @@ async def stock_zh_a_hist(
                 ("tencent", _tencent_kline, tencent_kwargs),
                 ("eastmoney", ak.stock_zh_a_hist, em_kwargs),
             ],
-            cache_name=f"{func_name}:{symbol}:{period}:{adjust}",
+            cache_name=(
+                f"{func_name}:{symbol}:{period}:{adjust}:"
+                f"{start_date}:{end_date}"
+            ),
+            cache_ttl=CACHE_TTL["stock_zh_a_hist"],
         )
         df = _normalize_hist_date_column(df)
         _record_stat(func_name, (time.time() - start) * 1000)
@@ -2279,6 +2317,132 @@ async def stock_zh_a_hist(
         _record_stat(func_name, (time.time() - start) * 1000, is_error=True)
         logger.error("K线全部数据源失败", symbol=symbol, error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# =====================================================================
+#  个股分析聚合接口（低延迟：快照 + K线并发，避免全市场行情）
+# =====================================================================
+
+@app.get("/api/stock/analysis_bundle")
+async def stock_analysis_bundle(
+    symbol: str = Query(..., description="六位 A 股股票代码，如 600519"),
+    days: int = Query(180, ge=30, le=500, description="历史K线自然日窗口"),
+):
+    """Return the data needed by ai-stock's individual analysis in one request."""
+    normalized_symbol = "".join(ch for ch in str(symbol) if ch.isdigit())
+    if len(normalized_symbol) != 6:
+        raise HTTPException(status_code=400, detail="symbol 必须为六位 A 股代码")
+
+    started_at = time.perf_counter()
+    func_name = "stock_analysis_bundle"
+    bundle_key = _cache_key(
+        func_name,
+        symbol=normalized_symbol,
+        days=days,
+    )
+    cached = cache.get(bundle_key)
+    if cached is not None:
+        result = dict(cached)
+        result["meta"] = dict(result.get("meta") or {})
+        result["meta"]["cache_hit"] = True
+        result["meta"]["elapsed_ms"] = round(
+            (time.perf_counter() - started_at) * 1000,
+            2,
+        )
+        _record_stat(func_name, result["meta"]["elapsed_ms"], cache_hit=True)
+        return {"status": "ok", "data": _safe_serialize(result)}
+
+    end_date = datetime.now().strftime("%Y%m%d")
+    start_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
+    hist_kwargs = {
+        "symbol": normalized_symbol,
+        "start_date": start_date,
+        "end_date": end_date,
+        "adjust": "qfq",
+    }
+
+    def _fetch_history() -> pd.DataFrame:
+        frame = _multi_source_call(
+            sources=[
+                ("tencent", _tencent_kline, hist_kwargs),
+                ("sina", _sina_stock_hist, hist_kwargs),
+                (
+                    "eastmoney",
+                    ak.stock_zh_a_hist,
+                    {
+                        "symbol": normalized_symbol,
+                        "period": "daily",
+                        "start_date": start_date,
+                        "end_date": end_date,
+                        "adjust": "qfq",
+                    },
+                ),
+            ],
+            cache_name=(
+                f"stock_zh_a_hist:{normalized_symbol}:daily:qfq:"
+                f"{start_date}:{end_date}"
+            ),
+            cache_ttl=CACHE_TTL["stock_zh_a_hist"],
+        )
+        return _normalize_hist_date_column(frame)
+
+    quote_result, history_result = await asyncio.gather(
+        asyncio.to_thread(_fetch_single_quote_tencent, normalized_symbol),
+        asyncio.to_thread(_fetch_history),
+        return_exceptions=True,
+    )
+
+    warnings = []
+    if isinstance(quote_result, Exception):
+        logger.warning(
+            "Analysis bundle quote failed",
+            symbol=normalized_symbol,
+            error=str(quote_result),
+        )
+        warnings.append(f"quote: {quote_result}")
+        quote = {}
+    else:
+        quote = quote_result
+
+    if isinstance(history_result, Exception):
+        logger.warning(
+            "Analysis bundle history failed",
+            symbol=normalized_symbol,
+            error=str(history_result),
+        )
+        warnings.append(f"history: {history_result}")
+        history = []
+    else:
+        history = history_result.to_dict(orient="records")
+
+    if not quote and not history:
+        _record_stat(
+            func_name,
+            (time.perf_counter() - started_at) * 1000,
+            is_error=True,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="所有个股分析数据源均不可用",
+        )
+
+    elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+    result = {
+        "symbol": normalized_symbol,
+        "quote": quote,
+        "history": history,
+        "meta": {
+            "cache_hit": False,
+            "elapsed_ms": elapsed_ms,
+            "history_rows": len(history),
+            "quote_source": quote.get("source") if quote else None,
+            "warnings": warnings,
+        },
+    }
+    serialized = _safe_serialize(result)
+    cache.set(bundle_key, serialized, CACHE_TTL[func_name])
+    _record_stat(func_name, elapsed_ms)
+    return {"status": "ok", "data": serialized}
 
 
 # =====================================================================

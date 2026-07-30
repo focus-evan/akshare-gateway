@@ -59,6 +59,7 @@ python app.py
 |------|------|---------|------|
 | `/api/stock/zh_a_spot_em` | 无 | 60s | A股全市场实时行情（优先腾讯全量/新浪，东财兜底） |
 | `/api/stock/zh_a_hist` | symbol,period,start_date,end_date,adjust | 5min | 个股历史K线（优先新浪K线，其次腾讯，东财兜底） |
+| `/api/stock/analysis_bundle` | symbol,days | 30s | ai-stock 个股分析聚合接口；并发返回腾讯单股快照与K线，避免拉取全市场行情 |
 | `/api/stock/a_indicator_lg` | symbol | 5min | PE/PB历史估值指标 |
 | `/api/stock/individual_info_em` | symbol | 5min | 个股详细信息（优先新浪VIP/腾讯，东财兜底） |
 
